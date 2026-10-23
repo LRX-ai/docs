@@ -1,0 +1,192 @@
+---
+title: "Hillclimber Tracker"
+sidebarTitle: "Hillclimber Tracker"
+description: "Scrape and track Canadian government staff movements from Hill Times articles using LLM extraction and GEDS verification."
+---
+
+The Hillclimber Tracker extracts structured staff entries from Hill Times "Hill Climbers" articles, verifies them against the Government Electronic Directory Services (GEDS), and stores the results in a PostgreSQL database. It also generates and verifies email candidates for tracked staff using an SMTP bounce-check loop.
+
+The repository is private and maintained by [LRX-ai on GitHub](https://github.com/lrx-ai/hillclimber-tracker).
+
+## Overview
+
+The pipeline reads Hill Climbers articles via a Western University library proxy, uses an Azure OpenAI LLM to extract structured personnel data, cross-references names and departments against GEDS, and writes the results to a database or CSV. A secondary email verification pipeline generates candidate addresses, sends probe emails, checks for bounces, and promotes valid addresses back into the main staff table.
+
+## How it works
+
+The system follows a multi-step pipeline:
+
+1. **Scrape article links** from the Hill Climbers listing page using Playwright, authenticating through the Western University proxy.
+2. **Filter new articles** by comparing URLs against already-processed sources in the database or CSV.
+3. **Extract article text** and feed it to an Azure OpenAI LLM with a structured JSON prompt to pull out names, titles, organizations, departments, and departure dates.
+4. **Enrich with GEDS** by scraping the Government Electronic Directory Services to confirm employment, fill in emails and phone numbers, and validate department mappings.
+5. **Write results** to `public.staff_gossip_goc` (PostgreSQL) or a local CSV, handling deduplication and backfill logic.
+6. **Generate email candidates** from department domain maps and common username formats.
+7. **Verify emails** by sending probe messages via SMTP and checking an IMAP inbox for bounces in a retry loop.
+8. **Promote valid emails** back into the staff table and clean up temporary candidate records.
+
+## Repository structure
+
+```text
+hillclimber-tracker/
+├── pipeline.py                    # End-to-end scraping and extraction pipeline
+├── requirements.txt               # Python dependencies
+├── README.md                      # Script-level usage docs
+├── Jenkinsfile                    # Weekly Jenkins job for the main pipeline
+├── JenkinsfileEmailVerification   # Downstream Jenkins job for email verification
+├── data/
+│   ├── geds_departments.csv       # Extracted GEDS department dimension table
+│   ├── geds_organizations.csv     # Extracted GEDS organization dimension table
+│   ├── geds_domain_map.json       # Department-to-email-domain mappings
+│   ├── ministers.csv              # Current cabinet roster from Parliament
+│   ├── backfill_manifest.jsonl    # Consolidated audit log for historical backfill
+│   └── backfill_audit_*.jsonl     # Per-run audit logs
+└── scripts/
+    ├── article_analyzer.py        # LLM extraction and CSV/DB write logic
+    ├── geds_scraper.py            # Playwright-based GEDS search and profile scraping
+    ├── minister_helper.py         # Cabinet minister ID resolution via LLM
+    ├── generate_email_candidates.py # Build email candidates from domain maps
+    ├── sendEmail.py               # SMTP probe sender
+    ├── checkBounce.py             # IMAP bounce checker
+    ├── check_email_loop_status.py # Report whether the verification loop is complete
+    ├── promote_valid_emails.py    # Move validated emails into staff_gossip_goc
+    ├── refresh_geds.py            # Reload GEDS dimension tables from raw export
+    ├── renumber_backfill.py       # Renumber historical rows chronologically
+    └── rollback_backfill.py       # Reverse backfill writes using audit logs
+```
+
+## Setup
+
+1. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+playwright install chromium
+```
+
+2. Create a `.env` file in the repository root with the variables listed below.
+
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint (e.g. `https://<resource>.openai.azure.com`) |
+| `AZURE_OPENAI_KEY` | API key for the Azure OpenAI resource |
+| `POSTGRES_USER` | Azure PostgreSQL username |
+| `POSTGRES_PASSWORD` | Azure PostgreSQL password |
+| `UWO_USER_ID` | Western University library proxy username |
+| `UWO_PASSWORD` | Western University library proxy password |
+| `SMTP_USER` | SMTP/IMAP username for email verification (used in Jenkins) |
+| `SMTP_PASSWORD` | SMTP/IMAP password for email verification (used in Jenkins) |
+
+## Usage
+
+### Main pipeline
+
+Run the full scraping, extraction, and enrichment pipeline:
+
+```bash
+python pipeline.py --out_csv results.csv
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--out_csv` | `results.csv` | Write output to CSV instead of the database |
+| `--dry_run` | off | List new article URLs without processing them |
+| `--headed` | off | Run the browser in headed mode for manual login |
+| `--max_articles` | `0` (all) | Limit the number of new articles to process |
+| `--start_date` | none | Process articles on or after this ISO date |
+| `--end_date` | none | Process articles on or before this ISO date |
+| `--backfill` | off | Historical backfill mode; reads the full archive via REST API |
+| `--geds_timeout_ms` | `20000` | Timeout per GEDS lookup in milliseconds |
+| `--geds_concurrency` | `3` | Max concurrent GEDS lookups |
+| `--timeout_ms` | `60000` | Page navigation timeout in milliseconds |
+| `--debug_page` | off | Dump listing page HTML and text for debugging |
+| `--log_level` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+
+### Single article analysis
+
+Process a single `.docx` or `.txt` article file:
+
+```bash
+python scripts/article_analyzer.py --input article.docx --out_csv results.csv
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--input` | required | Path to a `.docx` or `.txt` article file |
+| `--out_csv` | required | Path to the results CSV to append into |
+| `--dry_run` | off | Print extracted rows without writing the CSV |
+| `--print_prompt` | off | Print the exact LLM prompts and exit |
+| `--test_csv` | none | Load people from a CSV and test update logic (skips LLM) |
+| `--log_level` | `INFO` | Log verbosity |
+
+### GEDS refresh
+
+Reload department and organization dimension tables from a raw GEDS CSV export:
+
+```bash
+python scripts/refresh_geds.py data/gedsOpenData.csv
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `path` | required | Path to the raw GEDS CSV export |
+| `--keep-case` | off | Preserve original casing of IDs (default is lowercase) |
+
+### Email verification (manual)
+
+Generate candidates, send probes, check bounces, and promote valid addresses:
+
+```bash
+python -m scripts.generate_email_candidates
+python -m scripts.sendEmail --table public.email_candidates --email-col email --validated-col email_validated --invalidated-col email_invalidated --send-error-col send_error --smtp-host smtp.gmail.com --smtp-port 587 --smtp-user "$SMTP_USER" --smtp-password "$SMTP_PASSWORD" --from-email "$SMTP_USER" --subject "Email verification" --body "This is an automated verification probe. Please disregard."
+# Wait 10-15 minutes
+python -m scripts.checkBounce --table public.email_candidates --email-col email --validated-col email_validated --invalidated-col email_invalidated --imap-host imap.gmail.com --imap-port 993 --imap-email "$SMTP_USER" --imap-password "$SMTP_PASSWORD" --minutes 30
+python -m scripts.promote_valid_emails
+```
+
+## Data sources and outputs
+
+### Sources
+
+- **Hill Times articles**: Scraped via Playwright through the Western University library proxy (`www-hilltimes-com.proxy1.lib.uwo.ca`).
+- **GEDS (Government Electronic Directory Services)**: Scraped via Playwright to confirm employment and extract contact details.
+- **Parliament ministries CSV**: Downloaded from `ourcommons.ca` to keep the cabinet roster current.
+- **GEDS raw export**: Downloaded from [open.canada.ca](https://open.canada.ca/data/en/dataset/8ec4a9df-b76b-4a67-8f93-cdbc2e040098/resource/a1de6faa-cb68-4f47-aa57-efd46bd8f82b) for dimension table refresh.
+
+### Outputs
+
+- **`public.staff_gossip_goc`**: Main PostgreSQL table storing extracted staff entries with fields including name, title, organization, department, email, phone, GEDS confirmation dates, gossip source URL, and minister ID.
+- **`public.hillclimbers_articles`**: Stores raw article text and canonical URLs for deduplication.
+- **`public.email_candidates`**: Temporary table holding generated email addresses and their validation status.
+- **`public.geds_departments` and `public.geds_organizations`**: Dimension tables refreshed from the raw GEDS export.
+- **`mv_gossip_goc`**: Materialized view refreshed after each pipeline run for downstream consumers.
+- **CSV files**: Optional local output when `--out_csv` is used.
+
+## Scheduling and CI
+
+The repository includes two Jenkins pipelines:
+
+### Main pipeline (`Jenkinsfile`)
+
+- **Trigger**: Weekly cron at `H 8 * * 1` (Mondays at 8 AM).
+- **Steps**: Clone repository, create a Python virtual environment, install dependencies, run `pipeline.py`.
+- **Credentials**: UWO proxy credentials, PostgreSQL credentials, Azure OpenAI endpoint and key.
+- **Post-build**: On success, if new rows were inserted, it triggers the `hillclimber-email-verification` job with the inserted gossip numbers. Sends Discord notifications on success or failure.
+
+### Email verification pipeline (`JenkinsfileEmailVerification`)
+
+- **Trigger**: Downstream of the main pipeline, or manual.
+- **Steps**: Clone repository, generate email candidates, run a verification loop (send probes, wait, check bounces, repeat up to `MAX_ITERATIONS` times), then promote valid emails.
+- **Parameters**: `GOSSIP_NUMBERS` (from main pipeline), `MAX_ITERATIONS` (default 5), `BOUNCE_WAIT_MINUTES` (default 15).
+- **Post-build**: Cleans up the virtual environment and workspace; sends Discord notifications.
+
+## Tests
+
+There are no dedicated test files or test suites in the repository. Validation is performed through:
+
+- `--dry_run` flags on `pipeline.py` and `article_analyzer.py` to preview outputs without writing.
+- `--test_csv` mode on `article_analyzer.py` to test CSV write and update logic without calling the LLM.
+- `--print_prompt` on `article_analyzer.py` to inspect the exact prompts sent to the LLM.
+- Audit logs (`backfill_audit_*.jsonl`) and `rollback_backfill.py` for safe backfill experimentation.

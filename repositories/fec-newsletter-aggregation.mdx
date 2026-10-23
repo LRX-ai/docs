@@ -1,0 +1,252 @@
+---
+title: "FEC Newsletter Quarterly Aggregation"
+sidebarTitle: "FEC Newsletter Aggregation"
+description: "Quarterly aggregates of FEC money attributed to Queen Street Analytics newsletters."
+---
+
+This repository produces quarterly aggregates of Federal Election Commission (FEC) money attributed to Queen Street Analytics (QSA) newsletters. It runs two complementary pipelines that answer different questions about the same underlying transactions.
+
+The repository is available at [https://github.com/lrx-ai/fec-newsletter-aggregation](https://github.com/lrx-ai/fec-newsletter-aggregation).
+
+## Overview
+
+The project builds two CSV outputs from FEC bulk data:
+
+- **`send_quarterly.csv`**: trends in money each industry **put out**, attributed by the sender's catcode and broken down by recipient.
+- **`receive_quarterly.csv`**: trends in money reaching each **policy area**, attributed by the recipient candidate's congressional committee seats and broken down by sender.
+
+Both cover **2025Q1 through 2026Q2**. The two outputs are not two halves of one total; they attribute the same candidate money from opposite ends and must never be unioned.
+
+## How it works
+
+Both pipelines follow the same six stages over a normalized transaction set. They differ only in which side supplies the newsletter and which side becomes the breakdown dimension.
+
+<Steps>
+  <Step title="Extract">
+    Pull source tables from Postgres into local CSV caches using `COPY`. The FEC tables carry no indexes, so server-side joins are avoided.
+  </Step>
+  <Step title="Normalize">
+    Adapt `usa.fec_pac_to_pac` (OTH) and `usa.fec_pac_to_cand_current` (PAS2) into a common shape with columns for `source`, `sub_id`, `sender_id`, `recip_id`, `transaction_dt`, `amount`, `flow_type`, and `support_oppose`.
+  </Step>
+  <Step title="Deduplicate">
+    Collapse exact duplicates on `SUB_ID` across sources, normalize both sides of OTH transfers to `(sender, recip)`, and fingerprint on `(sender, recip, date, amount)` to catch same-day duplicates with different `SUB_ID`s.
+  </Step>
+  <Step title="Attribute">
+    Join to committee catcodes (send) or to congressional committee memberships via FEC CAND_ID -> bioguide -> committee -> newsletter (receive).
+  </Step>
+  <Step title="Fan out">
+    Expand multi-newsletter catcodes and committee weights so each row carries one newsletter.
+  </Step>
+  <Step title="Aggregate">
+    Group by quarter, newsletter, flow type, support/oppose stance, and counterparty, then sum amounts and count transactions.
+  </Step>
+</Steps>
+
+### Send pipeline (`run_send.py`)
+
+Newsletter comes from the **sender's catcode**. Sources are `usa.fec_pac_to_cand_current` plus `usa.fec_pac_to_pac`, deduplicated against each other on `SUB_ID`. Output is `out/send_quarterly.csv`.
+
+### Receive pipeline (`run_receive.py`)
+
+Newsletter comes from the **recipient candidate's congressional committee seats**, not a catcode, because candidates do not have one. Attribution follows three hops:
+
+1. FEC `CAND_ID` -> bioguide via `c_github_legislators_current_person.fec`
+2. bioguide -> committee code via `c_github_committee_membership_current`
+3. committee -> newsletter(s) via `congress_cmte_crosswalk.csv`
+
+Only **top-level committees** (4-character codes) are used; subcommittees are finer-grained than the newsletter scheme and would fragment attribution. Money is split evenly across each member's mapped committees, then evenly again within a committee's newsletters, so totals are additive across newsletters. Coverage is **incumbents only**: challengers, open-seat candidates, and defeated incumbents sit on no committee and are dropped.
+
+## Repository structure
+
+```text
+.
+├── .env.example                  # environment variable template
+├── requirements.txt              # Python dependencies
+├── README.md                     # detailed design notes and caveats
+├── run_send.py                   # entrypoint: send pipeline
+├── run_receive.py                # entrypoint: receive pipeline
+├── run_enrich.py                 # entrypoint: LLM crosswalk enrichment
+├── sql/                          # Postgres extraction queries
+│   ├── extract_transactions.sql  # OTH file (excludes 15J memo rows)
+│   ├── extract_pac_to_cand.sql   # PAS2 file
+│   ├── extract_committees.sql    # committee master with catcodes
+│   ├── extract_candidates.sql    # candidate lookup
+│   ├── extract_crosswalk.sql     # CRP catcode -> newsletter
+│   ├── extract_crosswalk_enhanced.sql  # CRP + LLM-inferred rows
+│   ├── extract_legislators.sql   # current legislators with FEC IDs
+│   ├── extract_committee_membership.sql # current committee seats
+│   ├── extract_legislator_terms.sql     # current term metadata
+│   ├── extract_congress_committees.sql # committee names and jurisdictions
+│   ├── extract_crp_cmte_mapping.sql     # fallback catcode mapping
+│   └── extract_candidate_races.sql      # 2025-2026 race incumbency flags
+├── src/fec_newsletter/           # core library
+│   ├── __init__.py
+│   ├── config.py                 # all tunable parameters and expected totals
+│   ├── extract.py                # Postgres caching layer
+│   ├── sources.py                # OTH and PAS2 normalizers
+│   ├── pipelines.py              # send and receive orchestration
+│   ├── common.py                 # shared stages: catcode resolution, fan-out, names
+│   ├── congress.py               # committee-seat attribution for receive
+│   ├── enrich.py                 # Azure OpenAI crosswalk enrichment
+│   ├── describe.py               # one-sentence PAC explanations
+│   ├── reporting.py              # console output and CSV/Parquet writers
+│   ├── elections.py              # 2026 primary calendar logic
+│   └── txn_types.py              # FEC transaction type metadata
+├── tests/
+│   ├── test_pipelines.py         # 59 stage assertions against live data
+│   └── test_enrich.py          # enrichment safety tests (no API calls)
+├── tools/                        # edition and reporting utilities
+│   ├── build_edition.py          # generate newsletter editions per channel
+│   ├── build_descriptions.py     # one-sentence PAC explanations
+│   ├── build_recipient_table.py  # ranked recipient tables for send
+│   ├── build_committee_roster.py # senior members and their funders
+│   ├── build_challenger_pairs.py # incumbent/challenger race pairs
+│   ├── build_category_ranks.py   # committee importance rankings
+│   ├── build_transaction_map.py  # regenerate docs/transaction_type_map.md
+│   ├── audit_crosswalk.py        # flag suspicious crosswalk rows
+│   ├── availability.py           # data-availability report by quarter
+│   ├── upload_enhanced_crosswalk.py # upload enriched crosswalk to Postgres
+│   └── edition_ui.py             # shared HTML rendering for editions
+├── docs/
+│   └── transaction_type_map.md   # how every TRANSACTION_TP is treated
+├── congress_cmte_crosswalk.csv   # hand-authored committee -> newsletter mapping
+├── newsletter_committee_ranks.csv # authored committee importance tiers
+├── crp_l_crosswalk.csv           # CRP catcode -> newsletter mapping
+├── enhanced_crp_l_crosswalk.csv  # LLM-enriched crosswalk output
+└── fec_primary_calendar_2026.csv # 2026 primary election dates
+```
+
+## Setup
+
+1. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+2. Copy the environment template and fill in your credentials:
+
+```bash
+cp .env.example .env
+```
+
+### Environment variables
+
+| Name | Purpose |
+| --- | --- |
+| `POSTGRES_USER` | Postgres username for FEC extracts |
+| `POSTGRES_PASSWORD` | Postgres password |
+| `PGHOST` | Postgres host |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI base URL (for enrichment) |
+| `AZURE_OPENAI_KEY` | Azure OpenAI API key |
+| `AZURE_OPENAI_DEPLOYMENT_CHAT` | Azure deployment name (default: `gpt-4.1`) |
+| `AZURE_OPENAI_API_VERSION` | API version (default: `2024-12-01-preview`) |
+
+## Usage
+
+Run the main pipelines:
+
+```bash
+python run_send.py                       # money sent by each industry
+python run_receive.py                    # money received by each industry
+python run_send.py --refresh             # re-pull from Postgres first
+python run_receive.py --refresh          # re-pull from Postgres first
+python run_send.py --parquet             # also write Parquet output
+python run_receive.py --parquet          # also write Parquet output
+```
+
+Run tests:
+
+```bash
+python -m pytest tests/
+```
+
+Regenerate the transaction type map:
+
+```bash
+python tools/build_transaction_map.py
+```
+
+Enrich the crosswalk with Azure OpenAI:
+
+```bash
+python run_enrich.py --dry-run           # preview candidates, no API calls
+python run_enrich.py --limit 50          # classify 50 committees (smoke test)
+python run_enrich.py                     # full run
+```
+
+Upload the enriched crosswalk:
+
+```bash
+python tools/upload_enhanced_crosswalk.py --dry-run   # validate only
+python tools/upload_enhanced_crosswalk.py             # write to usa.crp_l_crosswalk_enhanced
+```
+
+Build a newsletter edition for a channel:
+
+```bash
+python tools/build_edition.py --channel "Finance & Insurance"
+```
+
+## Data sources and outputs
+
+### Source tables (Postgres)
+
+| Table | Used by | Purpose |
+| --- | --- | --- |
+| `usa.fec_pac_to_pac` | Both | Committee-to-committee and candidate-directed disbursements (OTH file) |
+| `usa.fec_pac_to_cand_current` | Both | Committee-to-candidate contributions (PAS2 file) |
+| `usa.fec_committees_trim_mapped` | Send | Primary catcode source |
+| `usa.crp_fec_cmte_mapping` | Send | Fallback catcode mapping |
+| `usa.crp_l_crosswalk` | Send | Catcode -> newsletter mapping |
+| `usa.crp_l_crosswalk_enhanced` | Send | CRP mapping plus LLM-inferred committee rows |
+| `usa.c_github_legislators_current_person` | Receive | Legislator bioguide and FEC IDs |
+| `usa.c_github_committee_membership_current` | Receive | Current committee memberships |
+| `usa.c_github_legislators_current_terms` | Receive | Current party, chamber, state, district |
+| `usa.fec_candidates_trim` | Both | Candidate name and party lookup |
+| `usa.fec_candidate_master` | Tools | 2025-2026 race incumbency flags |
+
+### Outputs
+
+| File | Pipeline | Description |
+| --- | --- | --- |
+| `out/send_quarterly.csv` | Send | Money sent by industry, broken down by recipient |
+| `out/send_quarterly_coverage.csv` | Send | Row/dollar ledger per stage |
+| `out/receive_quarterly.csv` | Receive | Money received by policy area, broken down by sender |
+| `out/receive_quarterly_coverage.csv` | Receive | Row/dollar ledger per stage |
+| `enhanced_crp_l_crosswalk.csv` | Enrichment | LLM-inferred committee classifications |
+| `cache/*.csv` | Both | Cached Postgres extracts |
+| `cache/pac_descriptions.json` | Tools | Cached one-sentence PAC explanations |
+| `cache/recipient_table.json` | Tools | Ranked recipient tables per channel |
+| `cache/committee_roster_*.json` | Tools | Senior members and funders per channel |
+| `cache/challenger_pairs.json` | Tools | Incumbent/challenger race pairs |
+
+## Tests
+
+The test suite lives in `tests/` and contains 59 stage assertions against live cached data. Tests encode structural facts the pipelines silently depend on; if one fails, the source data changed shape and the pipelines need re-verification.
+
+Run all tests after caching extracts:
+
+```bash
+python run_send.py        # warms the shared cache
+python -m pytest tests/ -v
+```
+
+Key assertions include:
+
+- `SUB_ID` is unique within each table and shared across tables (the exact dedupe key)
+- No `15J` memo rows survive extraction
+- PAS2 filer is always the payer and `NAME` identifies the recipient
+- Direction sets (outflow, inflow, candidate-directed) are disjoint
+- Receipt codes (`30K`, `31K`, `32K`) are classified as inflows, not outflows
+- Send deduplication removes more than 100,000 rows across sources
+- Receive weights sum to 1.0 per candidate
+- Enhanced crosswalk is purely additive: CRP-attributed transactions survive unchanged
+
+## Important caveats
+
+- **Never sum across `flow_type`.** A direct contribution lands in the recipient's account; an independent expenditure is money spent _about_ a candidate that they never receive. `oppose` money is spent _against_ its target and is never netted against `support`.
+- **Send totals are not additive across newsletters** unless `config.MULTI_NEWSLETTER` is set to `"split"`. By default, 38 catcodes map to several newsletters and each gets the full amount. Receive is already additive because it splits evenly.
+- **Send sources have different spans.** `fec_pac_to_pac` covers 2025Q1 onward while PAS2 reaches back to 2023Q1. Widening the window gains quarters that contain candidate money only, which distorts trend interpretation.
+- **Receive is incumbents only.** Roughly 70% of candidate dollars go to challengers and open-seat candidates who sit on no committee and are dropped.
+- **Catcodes are a current snapshot.** Reclassifying a committee retroactively rewrites historical totals.

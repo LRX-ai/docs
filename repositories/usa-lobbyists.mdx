@@ -1,0 +1,238 @@
+---
+title: "usa_lobbyists"
+sidebarTitle: "USA Lobbyists"
+description: "Pipeline for discovering, verifying, and analyzing US lobbyist emails and specializations using LDA filings, Apollo.io, and SMTP probing."
+---
+
+[usa_lobbyists](https://github.com/lrx-ai/usa_lobbyists) is a data pipeline that enriches US lobbyist records from the Senate LDA database. It discovers work emails through a mix of web scraping, API lookups, and SMTP verification; it also analyzes lobbyist issue specializations so downstream systems can target outreach by industry.
+
+## Overview
+
+The repository produces two main outputs:
+
+1. **Verified lobbyist emails** written back to PostgreSQL (`l_lobbyists.email` and `l_active_lobbyist_email_list.email`).
+2. **Issue specialization and newsletter subscription mappings** exported as CSVs and plots in `data/lobbyist_specializations/`.
+
+The primary consumers are internal newsletter systems that need accurate, up-to-date contact lists segmented by lobbying focus area.
+
+## How it works
+
+The pipeline is organized into four stages. You can run each stage independently.
+
+<Steps>
+  <Step title="Filing data rebuild">
+    `rebuild_all_filings.py` paginates the LDA Senate API year-by-year, rebuilds the `l_filings_issue_lobbyists` junction table, and inserts any missing lobbyists into `l_lobbyists`.
+  </Step>
+  <Step title="Firm and email scraping">
+    `lda_email_scraper.py` uses Playwright to open the LDA print view for each lobbyist's most recent qualifying filing, extracts the firm name (registrant), and detects the firm's email format pattern.
+  </Step>
+  <Step title="Email discovery and verification">
+    A three-phase system finds and confirms addresses:
+
+    - **Apollo preview loop** (`apollo_preview_loop.py`) classifies lobbyists using Apollo's free search API.
+    - **Apollo match** (`apollo_email_lookup.py --apply`) spends credits to retrieve work emails for matched candidates.
+    - **SMTP probe** (`pingEmail.py`) validates patterns via direct MX RCPT-TO checks.
+    - **Bounce verification** (`sendEmail.py` + `checkBounce.py`) sends probe emails and checks IMAP for bounces to confirm deliverability.
+  </Step>
+  <Step title="Specialization analysis">
+    Scripts in `scripts/lobbyist_specializations/` attribute filing dollars to issues, rank lobbyists by top issue concentration, and map issues to newsletter categories.
+  </Step>
+</Steps>
+
+## Repository structure
+
+```text
+usa_lobbyists/
+├── Jenkinsfile                        # Daily Apollo preview pipeline (5 AM)
+├── JenkinsfileEmailVerification       # Daily email verification pipeline (7 AM)
+├── requirements.txt                   # Python dependencies
+├── data/
+│   └── lobbyist_specializations/      # CSVs and plots from analysis scripts
+├── scripts/
+│   ├── database.py                    # Shared PostgreSQL connection helper
+│   ├── apollo_preview_loop.py         # Rate-limited Apollo preview runner
+│   ├── apollo_email_lookup.py         # Preview + match + optional Playwright debug
+│   ├── import_apollo_emails.py        # Bulk import Apollo CSV results into DB
+│   ├── email_guessing/
+│   │   ├── pingEmail.py               # Parallel SMTP RCPT-TO probing
+│   │   ├── sendEmail.py               # Send verification probes via SMTP
+│   │   ├── checkBounce.py             # IMAP bounce detection and validation
+│   │   └── promote_valid_emails.py    # Promote validated guesses to lobbyist rows
+│   ├── filing_data/
+│   │   ├── rebuild_all_filings.py     # Full rebuild of filing/lobbyist junction
+│   │   ├── lda_email_scraper.py       # Playwright scraper for firm names and formats
+│   │   ├── check_filing_coverage.py   # Compare LDA API counts against local DB
+│   │   ├── clear_mismatched_emails.py # Remove emails whose domain mismatches firm
+│   │   └── recheck_duplicate_name_firms.py # Fix firm_name for duplicate-name lobbyists
+│   └── lobbyist_specializations/
+│       ├── lobbyist_issue_analysis.py # Top issue concentration per lobbyist
+│       ├── lobbyist_issue_tuples.py   # Ranked (lobbyist, issue) tuples with nominal $
+│       ├── specialization_distribution.py # Newsletter subscriber counts by cutoff
+│       └── top_issue_cutoff_analysis.py # Grid search for specialization thresholds
+```
+
+## Setup
+
+1. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+2. Create a `.env` file with the variables listed below. The repository uses `python-dotenv` to load them at runtime.
+
+| Variable | Purpose |
+| --- | --- |
+| `POSTGRES_USER` | Azure PostgreSQL username |
+| `POSTGRES_PASSWORD` | Azure PostgreSQL password |
+| `APOLLO_API_KEY` | Apollo.io API key (primary) |
+| `LDA_API_KEY` | Senate LDA API key (primary) |
+| `LDA_API_KEY_1` … `LDA_API_KEY_N` | Additional LDA keys for parallel workers |
+| `SMTP_USER` | SMTP/IMAP username (e.g. Gmail address) |
+| `SMTP_PASSWORD` | SMTP/IMAP app password |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI endpoint for LLM email guessing |
+| `AZURE_OPENAI_KEY` | Azure OpenAI API key |
+| `AZURE_OPENAI_DEPLOYMENT` | Model deployment name (default: `gpt-4o`) |
+| `AZURE_OPENAI_API_VERSION` | API version (default: `2024-05-01-preview`) |
+
+The database host is hardcoded in `database.py` as `newsletterpostgres.postgres.database.azure.com` on port `5432` with SSL required.
+
+## Usage
+
+### Filing data
+
+Rebuild the junction table and upsert missing lobbyists:
+
+```bash
+python scripts/filing_data/rebuild_all_filings.py
+python scripts/filing_data/rebuild_all_filings.py --resume   # skip already processed
+python scripts/filing_data/rebuild_all_filings.py --dry-run  # count only
+```
+
+Scrape firm names and email formats:
+
+```bash
+python scripts/filing_data/lda_email_scraper.py
+python scripts/filing_data/lda_email_scraper.py --start-id 4373
+python scripts/filing_data/lda_email_scraper.py --headless false
+```
+
+Check coverage against the LDA API:
+
+```bash
+python scripts/filing_data/check_filing_coverage.py --csv coverage.csv
+```
+
+Fix duplicate-name firm assignments:
+
+```bash
+python scripts/filing_data/recheck_duplicate_name_firms.py --dry-run
+```
+
+### Apollo email discovery
+
+Preview (free, no credits):
+
+```bash
+python scripts/apollo_preview_loop.py
+python scripts/apollo_preview_loop.py --dry-run
+python scripts/apollo_preview_loop.py --debug
+```
+
+Apply credits to retrieve emails for preview-matched candidates:
+
+```bash
+python scripts/apollo_email_lookup.py --apply --budget 200
+python scripts/apollo_email_lookup.py --apply --budget 200 --dry-run
+```
+
+Import a bulk Apollo CSV export:
+
+```bash
+python scripts/import_apollo_emails.py --apply
+```
+
+### SMTP verification
+
+Probe email patterns directly against MX servers:
+
+```bash
+python scripts/email_guessing/pingEmail.py
+python scripts/email_guessing/pingEmail.py --llm-guess --workers 10
+```
+
+Send verification emails and check for bounces:
+
+```bash
+python scripts/email_guessing/sendEmail.py --num-emails 30 --active-lobbyists
+python scripts/email_guessing/checkBounce.py --minutes 30 --delete-bounces
+python scripts/email_guessing/promote_valid_emails.py
+```
+
+### Specialization analysis
+
+Generate top-issue concentration data:
+
+```bash
+python scripts/lobbyist_specializations/lobbyist_issue_analysis.py --csv out.csv --plot out.png
+python scripts/lobbyist_specializations/lobbyist_issue_tuples.py --income --csv tuples.csv
+python scripts/lobbyist_specializations/specialization_distribution.py --average --cutoff 25000
+python scripts/lobbyist_specializations/top_issue_cutoff_analysis.py --income --plot dist.png
+```
+
+## Data sources and outputs
+
+### Sources
+
+- **LDA Senate API** (`https://lda.senate.gov/api/v1`): filing summaries, detail pages, and lobbying activity records.
+- **Apollo.io API**: people search preview (`mixed_people/api_search`) and match (`v1/people/match`).
+- **SMTP/IMAP (Gmail)**: bounce verification via `sendEmail.py` and `checkBounce.py`.
+
+### Database tables
+
+| Table | Role |
+| --- | --- |
+| `usa.l_lobbyists` | Master lobbyist registry (name, firm, email) |
+| `usa.l_active_lobbyist_email_list` | Subset of lobbyists eligible for outreach |
+| `usa.l_all_filings` | All filings fetched from LDA |
+| `usa.l_filings_issue_lobbyists` | Junction of filings, issues, and lobbyists |
+| `usa.l_lobbyist_firms` | Firm-level email format patterns and other known contacts |
+| `usa.apollo_email_lookups` | Apollo search/match state per lobbyist |
+| `usa.l_lobbyist_email_probes` | SMTP probe results (accepted, rejected, etc.) |
+| `usa.l_lobbyist_email_guesses` | Pending and validated email guesses from bounce testing |
+| `usa.l_filing_rebuild_log` | Checkpoint table for `rebuild_all_filings.py` |
+
+### File outputs
+
+The `data/lobbyist_specializations/` directory contains generated artifacts:
+
+- `lobbyist_issue_analysis.csv`: total dollars, top issue, and concentration percentage per lobbyist
+- `lobbyist_issue_tuples.csv`: ranked (lobbyist, issue) pairs with nominal dollar attribution
+- `lobbyist_income_analysis.csv` / `lobbyist_expense_analysis.csv`: income/expense breakdowns
+- PNG distribution plots for issue concentration, income, and expense
+
+## Scheduling and CI
+
+Two Jenkins pipelines run daily:
+
+### Apollo preview pipeline (`Jenkinsfile`)
+
+Triggered at 5 AM. Clones the repo, installs dependencies into a virtual environment, and runs `apollo_preview_loop.py` with Apollo and Postgres credentials. It posts success/failure notifications to a Discord webhook.
+
+### Email verification pipeline (`JenkinsfileEmailVerification`)
+
+Triggered at 7 AM. Runs three stages:
+
+1. **Send probes**: `sendEmail.py --num-emails 30 --active-lobbyists`
+2. **Wait and check bounces**: loops `checkBounce.py` up to 5 times with a configurable wait between sends and checks
+3. **Promote validated emails**: `promote_valid_emails.py`
+
+Both pipelines accept parameters for credential IDs, email batch size, and bounce wait minutes.
+
+## Tests
+
+There is no dedicated test suite in this repository. Validation is performed operationally through:
+
+- `check_filing_coverage.py`: compares local counts against the LDA API
+- `checkBounce.py`: confirms email deliverability via real SMTP bounces
+- Dry-run flags on most scripts (`--dry-run`) to preview changes before committing

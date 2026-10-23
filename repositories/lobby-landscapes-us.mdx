@@ -1,0 +1,240 @@
+---
+title: "Lobby Landscapes US"
+sidebarTitle: "Lobby Landscapes US"
+description: "Quarterly pipeline that turns US federal lobbying disclosures into per-industry HTML newsletters published on Ghost."
+---
+
+This repository powers the US edition of the Lobbying Landscapes newsletter. It turns raw Senate and House LDA filings into a set of per-industry HTML newsletters, then publishes them as posts on a [Ghost](https://ghost.org/) publication. Each newsletter ranks the sub-industries, clients, government entities, issues, and lobbyists whose disclosed spend deviated most from their recent historical baseline. An optional AI layer can add a "Real-World Context" section grounded in live web sources.
+
+The pipeline is a quarterly adaptation of the Canadian [lobby-landscapes-canada](https://github.com/LRX-ai/lobby-landscapes-canada) pipeline, migrated to US money-based data and a quarterly cadence.
+
+Source code: [github.com/lrx-ai/lobby-landscapes-us](https://github.com/lrx-ai/lobby-landscapes-us)
+
+## How it works
+
+The pipeline runs in three phases, orchestrated by `quarterly_run.py`:
+
+<Steps>
+  <Step title="Data phase (Steps 1-4)">
+    Pulls fact tables once from the database and shares them across the four ETL steps via a temporary `LOBBY_DATA_CACHE` pickle. Writes timestamped pivot CSVs into `output/` for sub-industries, clients, issues, entities, and lobbyists.
+  </Step>
+  <Step title="Analytics phase (Step 6)">
+    Runs `Step6_Analytics.py` once per channel in parallel (default 4 workers), assembling each channel's newsletter HTML plus charts into `final_export/`.
+  </Step>
+  <Step title="Ghost phase">
+    Uploads each `final_export/*.html` to Ghost as drafts by default. Use `--publish` to go live. Skipped with `--skip-ghost`.
+  </Step>
+</Steps>
+
+### Pipeline stages
+
+| Stage | Script | Role |
+| --- | --- | --- |
+| Config | `config.py` | Quarter arithmetic (target = most recent completed quarter; 6-quarter history) |
+| Load | `data_loader.py` | Loads `usa.*`, cleans and merges into filing, entity/issue, and officials frames |
+| Stats | `stats_utils.py` | Quarterly panel-residual trend |
+| ETL | `Step1_SubIndustry_and_Client.py`, `Step2_Issue.py`, `Step3_Entity.py`, `Step4_Lobbyist.py` | Quarterly value pivots for Sections A/B/C, E, D, and F |
+| Assemble | `Step6_Analytics.py` | Per-channel HTML: charts, interpretive text, and Key Takeaways |
+| AI (optional) | `implication_generator.py` | Real-World Context section plus dated revolving-door roles |
+| Publish | `ghost_client.py` | Upload and publish to Ghost |
+| Orchestrate | `quarterly_run.py` | Runs the above for all 19 channels |
+
+### Newsletter sections
+
+| Section | Grain |
+| --- | --- |
+| A | Lobbying spend by sub-industry (current quarter vs 6-quarter average) |
+| B | Sub-industry spend trend (panel residuals across quarters) |
+| C | Top client spend deviators |
+| D | Government entities lobbied (sub-industry to entity, client to entity) |
+| E | Lobbying issues (sub-industry to issue, client to issue) |
+| F | Most-active lobbyists and revolving door (channel to lobbyist) |
+| G | Organization network (interactive Plotly graph) |
+| \+ | Real-World Context (AI, `--with-ai` only) |
+
+## Repository structure
+
+```text
+lobby-landscapes-us/
+├── config.py                          # Quarter arithmetic and pipeline config
+├── data_loader.py                     # DB load, clean, merge into analysis frames
+├── stats_utils.py                     # Panel residual and quarter ordinal helpers
+├── Step1_SubIndustry_and_Client.py    # Sub-industry and client pivots (Sections A/B/C)
+├── Step2_Issue.py                     # Issue pivots (Section E)
+├── Step3_Entity.py                    # Government entity pivots (Section D)
+├── Step4_Lobbyist.py                # Lobbyist pivots (Section F)
+├── Step6_Analytics.py                 # Assemble one channel's newsletter HTML
+├── implication_generator.py           # AI Real-World Context and revolving-door dating
+├── ghost_client.py                    # Upload newsletters to Ghost CMS
+├── org_dedupe.py                      # LLM-assisted organization name deduplication
+├── quarterly_run.py                   # Master orchestrator
+├── requirements.txt                   # Python dependencies
+├── .env.example                       # Env var template
+├── crp_l_crosswalk.csv                # Catcode to channel (industry) taxonomy
+├── issues_lobbying.csv                # LDA issue code lookup
+├── scripts/
+│   ├── _common.py                     # Shared helpers for diagnostic dashboards
+│   ├── citation_diagnostic.py         # Per-newsletter source diagnostic
+│   ├── compare_enrichment.py          # Before/after enrichment diff
+│   └── implications_dashboard.py      # Coverage rollup across newsletters
+└── readme.md                          # Full project documentation
+```
+
+## Setup
+
+### Prerequisites
+
+- Python 3.14 (the venv is `.venv`)
+- PostgreSQL client libraries
+- System dependencies: `pandoc`, `parallel`, and MacTeX (for LaTeX rendering)
+
+### Dependencies
+
+The pinned `requirements.txt` targets older Python versions (up to 3.12). On Python 3.14, install current versions instead:
+
+```bash
+pip install statsmodels linearmodels matplotlib seaborn openai python-dotenv \
+            requests PyJWT pytz python-dateutil psycopg2-binary plotly \
+            kaleido networkx openpyxl
+```
+
+On Python 3.12 or earlier, you can use the pinned file:
+
+```bash
+pip install -r requirements.txt
+```
+
+### Environment variables
+
+Copy `.env.example` to `.env` and fill in real values. The file is gitignored.
+
+| Variable | Purpose |
+| --- | --- |
+| `LOBBY_DB_HOST` | Azure PostgreSQL host |
+| `LOBBY_DB_PORT` | Database port (default 5432) |
+| `LOBBY_DB_NAME` | Database name |
+| `LOBBY_DB_USER` | Database user |
+| `LOBBY_DB_PASSWORD` | Database password |
+| `LOBBY_DB_SCHEMA` | Schema name (default `usa`) |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI endpoint (for `--with-ai`) |
+| `AZURE_OPENAI_KEY` | Azure OpenAI API key |
+| `AZURE_OPENAI_DEPLOYMENT_CHAT` | Chat deployment name (default `gpt-4.1`) |
+| `AZURE_OPENAI_API_VERSION` | API version (default `2024-12-01-preview`) |
+| `GHOST_ADMIN_DOMAIN` | Ghost CMS domain |
+| `GHOST_ADMIN_API_KEY` | Ghost admin API key |
+
+## Usage
+
+### Full run for a specific quarter
+
+```bash
+python quarterly_run.py --target-quarter 2026-Q2 --with-ai --skip-ghost --yes
+```
+
+### One channel only
+
+```bash
+python quarterly_run.py --newsletter "Finance & Insurance" --skip-ghost --yes
+```
+
+### Upload to Ghost as drafts (default)
+
+```bash
+python quarterly_run.py --target-quarter 2026-Q2 --with-ai --yes
+```
+
+### Publish live instead of drafts
+
+```bash
+python quarterly_run.py --target-quarter 2026-Q2 --with-ai --publish --yes
+```
+
+### `quarterly_run.py` flags
+
+| Flag | Effect |
+| --- | --- |
+| `--target-quarter 2026-Q2` | Which quarter to report. Also accepts `2026Q2` or `2026-2`. Default: most recent completed quarter. |
+| `--steps {all,data,analytics}` | Run only part of the pipeline. `data` = Steps 1-4 only; `analytics` = Step 6 only (reuses the latest `output/` CSVs). |
+| `--newsletter "Finance & Insurance"` | Run analytics for a single channel only. |
+| `--with-ai` | Add the AI Real-World Context section plus dated revolving-door roles. |
+| `--max-workers N` | Parallel channels in the analytics phase (default 4). |
+| `--skip-ghost` | Do not upload to Ghost. |
+| `--publish` | Publish live (default is upload as drafts). |
+| `--yes` | Skip the interactive confirmation prompt. |
+| `--dry-run` | Print the plan and exit. |
+
+### Step scripts
+
+You can also run individual steps directly:
+
+```bash
+python Step1_SubIndustry_and_Client.py
+python Step2_Issue.py
+python Step3_Entity.py
+python Step4_Lobbyist.py
+python Step6_Analytics.py --newsletter "Finance & Insurance"
+```
+
+### Diagnostic scripts
+
+After running with `--with-ai`, inspect the AI output with:
+
+```bash
+python scripts/citation_diagnostic.py --quarter 2025-Q4
+python scripts/compare_enrichment.py --quarter 2025-Q4
+python scripts/implications_dashboard.py --quarter 2025-Q4
+```
+
+## Data sources and outputs
+
+### Input tables (Azure PostgreSQL, `usa` schema)
+
+| Table | Role |
+| --- | --- |
+| `l_all_filings` | Fresh filings base: client, registrant, income, expenses, filing type, year |
+| `l_all_filings_mapped` | Stale enrichment snapshot with `catcode` and cleaned client name |
+| `l_filings_issue_entities` | Entities (agencies) lobbied per filing/issue |
+| `l_filings_issue_descriptions` | Free-text lobbying descriptions |
+| `l_filings_lobbyists_officials` | Lobbyists plus disclosed covered government positions |
+
+### Local data files
+
+| File | Role |
+| --- | --- |
+| `crp_l_crosswalk.csv` | Maps `catcode` to channel (industry) and taxonomy |
+| `issues_lobbying.csv` | `IssueID` to issue name lookup |
+| `org_dedupe_crosswalk.csv` | Duplicate organization name merges |
+
+### Output directories
+
+| Directory | Contents |
+| --- | --- |
+| `output/` | Timestamped pivot CSVs from Steps 1-4 |
+| `final_export/` | Per-channel HTML newsletters and chart images (`img/`) |
+| `final_export/implications/` | AI implication JSONs (when `--with-ai` is used) |
+
+### The 19 channels
+
+```text
+Agri-Food, Automotive, Construction & Housing, Defense, Environment,
+Finance & Insurance, Fisheries, Foreign Affairs, Freight & Transport,
+Healthcare, Higher Ed, Hospitality & Retail, ICT & Cybersecurity,
+Manufacturing, Mining, Oil & Gas, Social Issues, Tribal Affairs,
+Utilities & Power
+```
+
+## Tests
+
+No automated test suite is present in this repository. Validation is done through the diagnostic scripts in `scripts/` and by inspecting the generated newsletters in `final_export/`.
+
+## Scheduling and CI
+
+No Jenkinsfiles or CI configuration files are present in this repository. The pipeline is designed to be run manually or scheduled via an external cron or orchestrator.
+
+## Notes
+
+- Re-runs are additive. Each run writes new timestamped files into `output/` and `final_export/`; nothing is overwritten. Step 6 in `--steps analytics` mode reads the latest `output/` CSVs by timestamp.
+- AI is slow and costs money. `--with-ai` adds live web-search calls per channel; expect the analytics phase to take noticeably longer.
+- Ghost defaults to drafts. You must pass `--publish` to go live.
+- Access tiers rotate per edition. `resolved_access()` in `ghost_client.py` alternates each channel between paid and free every quarter, so a channel that is paid this quarter is free next quarter.
+- The current source reads all secrets from `.env` only. Older reference files that contained hardcoded secrets are excluded from the repo via `.gitignore`.

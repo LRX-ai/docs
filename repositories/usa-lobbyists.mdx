@@ -11,7 +11,7 @@ description: "Pipeline for discovering, verifying, and analyzing US lobbyist ema
 The repository produces two main outputs:
 
 1. **Verified lobbyist emails** written back to PostgreSQL (`l_lobbyists.email` and `l_active_lobbyist_email_list.email`).
-2. **Issue specialization and newsletter subscription mappings** exported as CSVs and plots in `data/lobbyist_specializations/`.
+2. **Issue specializations** written to PostgreSQL (`l_active_lobbyist_email_list.specializations`), plus specialization and newsletter subscription mappings exported as CSVs and plots in `data/lobbyist_specializations/`.
 
 The primary consumers are internal newsletter systems that need accurate, up-to-date contact lists segmented by lobbying focus area.
 
@@ -35,7 +35,7 @@ The pipeline is organized into four stages. You can run each stage independently
     - **Bounce verification** (`sendEmail.py` + `checkBounce.py`) sends probe emails and checks IMAP for bounces to confirm deliverability.
   </Step>
   <Step title="Specialization analysis">
-    Scripts in `scripts/lobbyist_specializations/` attribute filing dollars to issues, rank lobbyists by top issue concentration, and map issues to newsletter categories.
+    Scripts in `scripts/lobbyist_specializations/` attribute filing dollars to issues, rank lobbyists by top issue concentration, and map issues to newsletter categories. `write_lobbyist_specializations.py` writes each active lobbyist's issue specializations to the `specializations` column of `l_active_lobbyist_email_list`.
   </Step>
 </Steps>
 
@@ -68,6 +68,7 @@ usa_lobbyists/
 │       ├── lobbyist_issue_analysis.py # Top issue concentration per lobbyist
 │       ├── lobbyist_issue_tuples.py   # Ranked (lobbyist, issue) tuples with nominal $
 │       ├── specialization_distribution.py # Newsletter subscriber counts by cutoff
+│       ├── write_lobbyist_specializations.py # Write per-lobbyist specializations to DB
 │       └── top_issue_cutoff_analysis.py # Grid search for specialization thresholds
 ```
 
@@ -180,6 +181,27 @@ python scripts/lobbyist_specializations/specialization_distribution.py --average
 python scripts/lobbyist_specializations/top_issue_cutoff_analysis.py --income --plot dist.png
 ```
 
+Write specializations to the database:
+
+```bash
+python scripts/lobbyist_specializations/write_lobbyist_specializations.py
+python scripts/lobbyist_specializations/write_lobbyist_specializations.py --dry-run          # compute only, no writes
+python scripts/lobbyist_specializations/write_lobbyist_specializations.py --threshold 10000  # lower the minimum amount
+```
+
+For each lobbyist, the script averages the nominal dollars attributed to each issue over the 4 most recent quarters in `l_all_filings`. Nominal dollars combine income and expenses. When an amendment exists for a quarterly filing, the most recent amendment replaces the base filing if its amount is positive and differs from the base. A filing's amount is split evenly across the issues each lobbyist is listed on.
+
+The script keeps issues whose quarterly average is at least `--threshold` dollars (default `20000`) and writes them as a JSON list, largest first:
+
+```json
+[
+  {"issue": "HCR", "amount": 85000.0},
+  {"issue": "TAX", "amount": 32500.5}
+]
+```
+
+Rows are matched on first name, last name, and firm name (case-insensitive). Lobbyists with no qualifying issues get `NULL`. On a normal run, the script creates the column with `ADD COLUMN IF NOT EXISTS specializations jsonb` before updating rows. `--dry-run` prints the quarters used, counts, and a sample without changing the database.
+
 ## Data sources and outputs
 
 ### Sources
@@ -193,7 +215,7 @@ python scripts/lobbyist_specializations/top_issue_cutoff_analysis.py --income --
 | Table | Role |
 | --- | --- |
 | `usa.l_lobbyists` | Master lobbyist registry (name, firm, email) |
-| `usa.l_active_lobbyist_email_list` | Subset of lobbyists eligible for outreach |
+| `usa.l_active_lobbyist_email_list` | Subset of lobbyists eligible for outreach; the `specializations` jsonb column holds ranked issue codes and average quarterly dollars |
 | `usa.l_all_filings` | All filings fetched from LDA |
 | `usa.l_filings_issue_lobbyists` | Junction of filings, issues, and lobbyists |
 | `usa.l_lobbyist_firms` | Firm-level email format patterns and other known contacts |

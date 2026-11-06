@@ -1,0 +1,150 @@
+---
+title: "EU_vote_newsletter"
+sidebarTitle: "EU Vote Newsletter"
+description: "Per-sector voting-block newsletter of European Parliament roll-call votes, rendered as HTML and published via Ghost."
+---
+
+EU_vote_newsletter generates a per-sector newsletter for European Parliament roll-call votes. Each voting block produces one HTML page per sector, complete with LLM-generated narratives, party-split visualizations, and defector callouts. Pages are pushed as drafts or live posts via the shared `queen-street-analytics-1` Ghost tenant, using the same 18 mailing lists shared with `EU_lobby_newsletter`.
+
+The repository is maintained by [LRX-ai on GitHub](https://github.com/lrx-ai/EU_vote_newsletter).
+
+## Overview
+
+The pipeline consumes roll-call data written by the daily scraper job in the `eu-parliament-database` repository. A voting block is a continuous run of days on which the EP held roll-call votes. When a block closes, `block_run.py` loops over all 18 sectors, renders an HTML newsletter for each via `newsletter.py`, and pushes the result to Ghost as a draft or a live post. Each sector's newsletter alternates between free (public) and paid (members-only) access on odd and even editions.
+
+## How it works
+
+1. **Scraper** runs daily in the `eu-parliament-database` repo and writes votes to `eu.eu_rollcall_vote*` tables.
+2. **Block detector** in the scraper repo decides whether the recent voting block is closed (no votes for at least 3 days). If closed, it triggers the newsletter pipeline.
+3. **Newsletter pipeline** reads the fact rows for the given sector and block, produces an LLM narrative, renders party-split SVG charts, and lays out per-bill blocks sorted by contention.
+4. **Ghost publisher** converts the HTML into a Ghost-safe payload, uploads the SVG feature-image rasterized as a PNG, and creates (or overwrites) a draft post tagged to the sector's mailing list.
+5. **Block state** is recorded in `eu.eu_rollcall_block_run` so downstream triggers know the block has already been published.
+
+## Repository structure
+
+```text
+eu_vote_newsletter/
+├── newsletter.py                 # Per-sector composer (main entry point)
+├── block_run.py                  # Batch runner across all 18 sectors
+├── block_utils.py                # Voting-block detection + labelling helpers
+├── block_state.py                # eu_rollcall_block_run state I/O
+├── ghost_publish.py              # Ghost admin API client (drafts, publish, image upload)
+├── db_conn.py                    # Shared Postgres connection (Azure)
+├── data/
+│   ├── __init__.py               # (empty marker)
+│   └── fact_rollcall_vote.py     # In-memory fact loader + party-split and defector helpers
+├── section_1_descriptive.py      # Legacy standalone descriptive section
+├── section_2_contentiousness.py  # Legacy standalone contentiousness section
+├── block_run.py                  # Batch runner across all 18 sectors
+├── requirements.txt              # Python dependencies
+├── README.md                     # Data-flow docs + local-dev usage
+└── .env.example                  # Env template (no real secrets)
+```
+
+## Setup
+
+1. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+2. Create a `.env` file in the repository root with the variables listed below.
+
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `SQL_HOST` | Azure PostgreSQL host |
+| `SQL_PORT` | PostgreSQL port |
+| `SQL_DBNAME` | Database name |
+| `SQL_USER` | PostgreSQL username |
+| `SQL_PASSWORD` | PostgreSQL password |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint |
+| `AZURE_OPENAI_KEY` | Azure OpenAI API key |
+| `AZURE_OPENAI_DEPLOYMENT_CHAT` | Chat model deployment name |
+| `GHOST_ADMIN_DOMAIN` | Ghost admin domain |
+| `GHOST_ADMIN_API_KEY` | Ghost admin API key |
+
+## Usage
+
+### Render one sector locally (no Ghost push)
+
+```bash
+python newsletter.py --sector "Foreign Affairs" --start 2026-07-07 --end 2026-07-09
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--sector` | required | Sector name, e.g. "Foreign Affairs" |
+| `--start` | none | Block start date, YYYY-MM-DD |
+| `--end` | none | Block end date, YYYY-MM-DD |
+| `--out` | auto | Output HTML path |
+| `--no-llm` | off | Skip LLM narrative call (fast/offline) |
+
+### Auto-detect and publish all sectors
+
+```bash
+# Stage 1: render + push as drafts for human review
+python block_run.py --latest --publish
+
+# Stage 2: render + push + immediately publish live
+python block_run.py --latest --auto-publish
+
+# Dry run
+python block_run.py --latest --dry-run
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--start` | none | Block start date |
+| `--end` | none | Block end date |
+| `--latest` | off | Auto-detect the most recent closed block |
+| `--sectors` | all 18 | Restrict to specific space-separated sectors |
+| `--dry-run` | off | Print the plan without rendering |
+| `--no-llm` | off | Pass `--no-llm` to each sector render |
+| `--publish` | off | Push rendered HTML to Ghost as DRAFTS |
+| `--auto-publish` | off | Push AND publish live |
+
+### Ghost publish (single post)
+
+```bash
+python ghost_publish.py --sector "Foreign Affairs" --block-lbl "Jul 7–9, 2026" --block-slug "2026-07-07_2026-07-09" --html out/foreignaffairs_2026-07-07_2026-07-09.html
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--sector` | required | Sector name |
+| `--block-lbl` | required | Human block label |
+| `--block-slug` | required | ISO block slug |
+| `--html` | required | Path to rendered HTML file |
+| `--auto-publish` | off | Also flip the draft to published immediately |
+
+## Data sources and outputs
+
+### Sources
+
+- **`eu.eu_rollcall_vote`**: Roll-call votes written by the daily scraper in the `eu-parliament-database` repo.
+- **`eu.eu_rollcall_vote_cast`**: Individual MEP votes.
+- **`eu.eu_rollcall_vote_newsletter`**: Sector mapping for each document.
+- **`eu.eu_rollcall_vote_document_titles`**: Human-readable document titles.
+- **`eu.eu_motion`**: Motion-level metadata for rapporteur extraction.
+- **`eu.eu_mep`**: MEP master data (name, country, political group).
+- **`eu.eu_rollcall_mep_cohesion`**: Used implicitly by the party-split and defector logic.
+
+### Outputs
+
+- **Local HTML files**: One file per (sector, block) in `out/`.
+- **Ghost posts**: Drafts or live posts on the `queen-street-analytics-1` tenant, tagged to the sector's EU newsletter slug.
+- **`eu.eu_rollcall_block_run`**: Tracks which blocks have been published and how many sectors were drafted.
+
+## Scheduling and CI
+
+There are no Jenkinsfiles or GitHub Actions workflows in this repository. The pipeline is triggered downstream by the scraper repo's `check_closed_block.py` script when it detects a closed voting block (no EP votes for at least 3 days). Jenkins passes `BLOCK_START` and `BLOCK_END` as parameters to `block_run.py`.
+
+## Tests
+
+There are no dedicated test files or test suites in the repository. Validation is performed through:
+
+- `--dry-run` on `block_run.py` to preview which sectors would be rendered.
+- `--no-llm` on `newsletter.py` and `section_1_descriptive.py` to render without API calls.

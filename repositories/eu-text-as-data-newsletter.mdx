@@ -1,0 +1,239 @@
+---
+title: "eu-text-as-data-newsletter"
+sidebarTitle: "EU Text-as-Data Newsletter"
+description: "Collect, embed, and transform European Union policy data into industry-focused newsletters and Ghost publications."
+---
+
+The EU Text-as-Data Newsletter pipeline scrapes European Union institutional sources, stores the results in PostgreSQL, generates multilingual vector embeddings for semantic retrieval, and produces industry-specific markdown newsletters that are published through Ghost.
+
+The repository is maintained by [LRX-ai on GitHub](https://github.com/lrx-ai/eu-text-as-data-newsletter).
+
+## Overview
+
+The pipeline covers three main stages: data collection, enrichment, and newsletter generation. Ten EU scrapers collect press releases, meeting calendars, parliamentary agendas, committee documents, motions, hearings, and EUR-Lex legal acts. Each scraper inserts content into a dedicated PostgreSQL table with deduplication by URL or composite key. Embeddings are generated with Cohere embed-multilingual-v3.0 and stored as pgvector vectors for semantic ranking. A newsletter builder queries the vector store, filters results with an Azure OpenAI relevancy classifier, and generates a markdown report. A separate bulk uploader creates Ghost draft posts with industry-specific newsletter slugs and imagery.
+
+## How it works
+
+1. **Collect data** by running ten EU scrapers sequentially: Commission Press Corner, Council Meeting Calendar, EUR-Lex Documents, EP Plenary Agendas, EP Committee Schedules, EP Committee Hearings, EP Committee Latest Documents, EP Committee Press Releases, EP Committee Meeting Documents, and EP Motion Documents.
+2. **Embed new rows** by calling Cohere for multilingual vector embeddings and updating the `embedding_status` column from `pending` to `done`.
+3. **Rank candidates** by embedding the industry search query and selecting the top-N rows per source ordered by L2 distance.
+4. **Filter for relevancy** with an Azure OpenAI LLM prompt that classifies each candidate as YES or NO relevant to the industry.
+5. **Generate the newsletter** by assembling filtered events into sections (Calendar, Commission, Legislation, Parliament, Council, EP Motions, Committee Work, What We Are Reading) and writing Markdown, JSON, and prompt outputs.
+6. **Upload to Ghost** as draft posts tagged `#EU` and mapped to the corresponding industry newsletter slug.
+7. **Publish newsletters** by matching draft post titles to the industry newsletter slug map and switching their status to published.
+
+## Repository structure
+
+```text
+eu-text-as-data-newsletter/
+├── scrapers/                         # EU source scrapers
+│   ├── commission_press_corner_db.py # EC press releases
+│   ├── council_meeting_calendar_db.py
+│   ├── eurlex_documents_db.py
+│   ├── ep_plenary_agendas_db.py
+│   ├── ep_committee_schedules_db.py
+│   ├── ep_committee_hearings_db.py
+│   ├── ep_committee_latest_documents_db.py
+│   ├── ep_committee_meeting_documents_db.py
+│   ├── ep_committee_press_releases_db.py
+│   └── ep_motion_documents_db.py
+├── src/
+│   ├── lib/
+│   │   ├── logger.py                 # Logging utilities
+│   │   ├── openai_model.py           # Azure OpenAI chat model setup
+│   │   └── postgres_connection.py    # Peewee and psycopg2 connections
+│   ├── newsletter/
+│   │   ├── base_classes.py           # Event and newsletter Pydantic models
+│   │   ├── eu_create_newsletter_content.py  # Main newsletter assembler
+│   │   ├── eu_vector_query.py        # Cohere embedding + top-N ranking
+│   │   ├── eu_relevancy.py           # LLM relevancy filter
+│   │   └── eu_*_events.py            # Per-source newsletter builders
+│   └── web/
+│       ├── categories_eu.csv         # Industry title and description map
+│       └── dates_eu.csv              # Issue number and date ranges
+├── config/
+│   └── sources_registry.csv          # Source metadata and update frequency
+├── newsletter/
+│   ├── eu_database_models.py         # Peewee ORM models for EU tables
+│   └── eu_newsletter_content.xlsx    # Newsletter content reference data
+├── requirements/
+│   └── requirements.txt              # Python dependencies
+├── article-images/                   # Images referenced by generated reports
+├── docs_eu/                          # Generated HTML reports and newsletters
+├── run_scrapers.py                   # Sequential scraper runner
+├── run_eu_newsletter.py              # Newsletter generator CLI
+├── publish_eu_newsletters.py         # Ghost post publisher
+├── backfill_embeddings.py            # Cohere embedding backfill tool
+├── eu_newsletter_tracker.py          # Ghost post counter and DB upsert
+├── update_dates_eu.py                # Increment issue number and date range
+├── bulk_eu.py                        # Bulk newsletter generator + Ghost uploader
+├── all-newsletters.py                # Ghost newsletter and tag aggregator
+├── PROD_EU_News.py                   # SerpAPI news scraper and DB inserter
+└── test_eu_newsletter.py             # Manual test script for event builders
+```
+
+## Setup
+
+1. Install dependencies:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements/requirements.txt
+playwright install
+```
+
+2. Create a `.env` file in the repository root with the variables listed below.
+
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `POSTGRES_USER` | Primary PostgreSQL username |
+| `POSTGRES_PASSWORD` | Primary PostgreSQL password |
+| `POSTGRES_DB_NAME` | Primary PostgreSQL database name |
+| `POSTGRES_HOST` | Primary PostgreSQL host |
+| `POSTGRES_PORT` | Primary PostgreSQL port |
+| `QSA_POSTGRES_USER` | QSA PostgreSQL username |
+| `QSA_POSTGRES_PASSWORD` | QSA PostgreSQL password |
+| `QSA_POSTGRES_DB_NAME` | QSA PostgreSQL database name |
+| `QSA_POSTGRES_HOST` | QSA PostgreSQL host |
+| `QSA_POSTGRES_PORT` | QSA PostgreSQL port |
+| `EU_POSTGRES_USER` | EU PostgreSQL username |
+| `EU_POSTGRES_PASSWORD` | EU PostgreSQL password |
+| `EU_POSTGRES_DB_NAME` | EU PostgreSQL database name |
+| `EU_POSTGRES_HOST` | EU PostgreSQL host |
+| `EU_POSTGRES_PORT` | EU PostgreSQL port |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint |
+| `AZURE_OPENAI_KEY` | Azure OpenAI API key |
+| `OPENAI_API_VERSION` | Azure OpenAI API version |
+| `AZURE_OPENAI_DEPLOYMENT_CHAT` | Azure OpenAI chat deployment name |
+| `AZURE_OPENAI_CHAT_MODEL_NAME` | Azure OpenAI chat model name |
+| `COHERE_API_KEY` | Cohere embedding API key |
+| `COHERE_API_URL` | Cohere embedding endpoint URL |
+
+## Usage
+
+### Run scrapers
+
+Run all configured EU scrapers sequentially:
+
+```bash
+python run_scrapers.py
+```
+
+### Generate a newsletter
+
+Generate a report for a preset industry using the default 14-day window:
+
+```bash
+python run_eu_newsletter.py --industry healthcare
+```
+
+Specify a custom reporting window:
+
+```bash
+python run_eu_newsletter.py \
+  --industry environment \
+  --start-date 2026-03-01 \
+  --end-date 2026-03-20
+```
+
+Use a custom industry:
+
+```bash
+python run_eu_newsletter.py \
+  --custom "Digital Markets" \
+  --description "EU policy and regulation affecting digital markets" \
+  --days 14
+```
+
+Write generated files to a custom directory:
+
+```bash
+python run_eu_newsletter.py \
+  --industry finance \
+  --days 7 \
+  --output output
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--industry` | `healthcare` | Preset industry key (see code for full list) |
+| `--custom` | none | Custom industry title (overrides `--industry`) |
+| `--description` | none | Custom industry description |
+| `--days` | `14` | Number of days for the reporting window |
+| `--start-date` | none | Window start in `YYYY-MM-DD` (overrides `--days`) |
+| `--end-date` | none | Window end in `YYYY-MM-DD` (defaults to today) |
+| `--output` | `output` | Directory for Markdown, JSON, and prompt outputs |
+
+### Backfill embeddings
+
+Backfill Cohere embeddings for all institutional source tables:
+
+```bash
+python backfill_embeddings.py
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--tables` | all 9 tables | Subset of tables to process |
+| `--limit` | none | Max pending rows per table |
+| `--skip-indexes` | off | Skip the `CREATE INDEX` step |
+
+### Update date range
+
+Preview the next Monday-Sunday range and issue number:
+
+```bash
+python update_dates_eu.py
+```
+
+Apply the update to `src/web/dates_eu.csv`:
+
+```bash
+python update_dates_eu.py --write
+```
+
+### Publish newsletters
+
+Publish all EU draft posts from Ghost with their newsletter slugs:
+
+```bash
+python publish_eu_newsletters.py
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--dry-run` | off | Print what would happen without making changes |
+| `--test` | off | Publish only the first matching post then stop |
+
+## Data sources and outputs
+
+### Sources
+
+- **European Commission Press Corner**: Press releases and announcements.
+- **Council of the EU Meeting Calendar**: Upcoming ministerial meetings and policy signals.
+- **European Parliament Plenary Agendas**: Debates and votes.
+- **European Parliament Committee Schedules, Hearings, Documents, and Press Releases**: Committee-level activity.
+- **EP Motion Documents**: Parliamentary motions.
+- **EUR-Lex**: Regulations, directives, and legal texts.
+- **SerpAPI news search**: Pan-European and major national outlets for general EU news.
+
+### Outputs
+
+- **PostgreSQL tables**: One table per scraper under the `eu` schema, plus `e_eu_news` for SerpAPI articles. Each row stores metadata, content, embedding, and embedding status.
+- **Markdown newsletters**: Industry reports with calendar, commission, legislation, parliament, council, motions, committee work, and reading sections.
+- **JSON representations**: Structured output of the newsletter content.
+- **Prompt files**: The prompt used for generation.
+- **Ghost drafts and published posts**: Uploaded through the Ghost Admin API with `#EU` tags and mapped newsletter slugs.
+- **HTML reports**: Generated in `docs_eu/` for web display.
+
+## Scheduling and CI
+
+There are no Jenkins files or GitHub Actions workflows in this repository. Scrapers and newsletter generation are run manually or triggered by external scheduling.
+
+## Tests
+
+The repository includes `test_eu_newsletter.py`, a manual script that exercises the Council meetings, Parliament plenary, and EUR-Lex event builders and prints the number of events returned for each. It does not use a test runner like `pytest`, and there are no automated assertions.

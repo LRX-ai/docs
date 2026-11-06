@@ -19,10 +19,22 @@
       {
         "group": "Repositories",
         "pages": [
+          "repositories/ca-vote-newsletter",
+          "repositories/eu-lobby-newsletter",
+          "repositories/eu-text-as-data-newsletter",
+          "repositories/eu-vote-newsletter",
           "repositories/fec-newsletter-aggregation",
           "repositories/hillclimber-tracker",
           "repositories/lobby-landscapes-us",
-          "repositories/usa-lobbyists"
+          "repositories/newsletter-usa-spending",
+          "repositories/us-vote-newsletter",
+          "repositories/usa-lobbyists",
+          "repositories/newsletter-usa-spending",
+          "repositories/eu-lobby-newsletter",
+          "repositories/ca-vote-newsletter",
+          "repositories/eu-vote-newsletter",
+          "repositories/us-vote-newsletter",
+          "repositories/eu-text-as-data-newsletter"
         ]
       }
     ],

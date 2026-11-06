@@ -1,0 +1,185 @@
+---
+title: "CA_vote_newsletter"
+sidebarTitle: "CA Vote Newsletter"
+description: "Per-sector newsletter of Canadian House of Commons roll-call votes, published once per voting block via Ghost."
+---
+
+The CA Vote Newsletter renders per-sector HTML newsletters from Canadian House of Commons roll-call voting data and publishes them to Ghost as one post per (sector x voting block). It consumes data produced by the sibling `CA_vote_scraper` repository and is designed to follow the same editorial layout and two-stage publishing workflow as the EU Vote Newsletter.
+
+The repository is maintained by [LRX-ai on GitHub](https://github.com/lrx-ai/CA_vote_newsletter).
+
+## Overview
+
+Each newsletter covers one policy sector (for example, "Finance & Insurance") during one continuous House of Commons sitting block (a run of roll-call voting days). For every bill voted on in that block and sector, the newsletter shows the final tally, party-level vote splits, defector MPs, and LLM-generated narrative context. The rendered output is an HTML file with an embedded party-split SVG chart for each bill. A feature SVG and excerpt sidecar accompany each HTML file for consumption by the Ghost publisher.
+
+The system supports a two-stage Ghost publishing rollout: drafts for editorial review, then live publishing with optional subscriber emails.
+
+## How it works
+
+The pipeline follows these steps:
+
+1. **Load fact rows** from `CA_vote_scraper` Postgres tables (`hoc_voting_data`, `hoc_vote_sector`, `hoc_voting_ballot`, `hoc_mp_roster`), filtered by sector and block date range.
+2. **Summarize bills** by grouping fact rows per bill (by `bill_number_code` or a `DIV-{n}` fallback for procedural votes), picking the 3rd-reading vote as the reference row when available.
+3. **Generate an LLM narrative** via Azure OpenAI that summarizes the themes of the voting block in 3-4 sentences.
+4. **Generate per-bill context** via Azure OpenAI that explains what each bill is about and why it matters.
+5. **Render an HTML newsletter** containing a stats bar, TL;DR box, sector narrative, and per-bill blocks with vote tallies, party-split SVGs, and defector callouts.
+6. **Write sidecar files** alongside the HTML: a feature SVG (party split of the most-contested bill) and a 200-character excerpt for Ghost's `custom_excerpt`.
+7. **Optionally publish to Ghost** by wrapping the HTML in a Ghost HTML card, rasterizing the feature SVG to a PNG, and creating or overwriting a draft/post via the Ghost Admin API.
+
+## Repository structure
+
+```text
+CA_vote_newsletter/
+├── newsletter.py              # Per-sector composer (HTML + SVG + LLM narrative)
+├── block_run.py               # Batch runner across all 20 sectors for one block
+├── block_utils.py             # Block label/slug formatting helpers
+├── block_state.py             # hoc_vote_block_run I/O (tracks published blocks)
+├── ghost_publish.py           # Ghost Admin API client (drafts, publish, images)
+├── publish_existing_drafts.py # Promote all CA-voting Ghost drafts to published
+├── db_conn.py                 # Postgres connection factory (env-driven)
+├── data/
+│   └── fact_ca_vote.py        # In-memory fact loader + party splits + defectors
+├── sql/
+│   └── init.sql               # CREATE TABLE hoc_vote_block_run
+├── requirements.txt           # Python dependencies
+├── .env.example               # Template for environment variables
+└── out/                       # Rendered HTML + feature SVG + excerpt sidecars
+```
+
+## Setup
+
+1. Install dependencies:
+
+```bash
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+2. Apply the block-run state table:
+
+```bash
+psql "$PG_URL" -f sql/init.sql
+```
+
+3. Create a `.env` file in the repository root with the variables listed below. The same credentials as `CA_vote_scraper` can be reused.
+
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `SQL_HOST` | PostgreSQL host |
+| `SQL_PORT` | PostgreSQL port |
+| `SQL_DBNAME` | PostgreSQL database name |
+| `SQL_USER` | PostgreSQL username |
+| `SQL_PASSWORD` | PostgreSQL password |
+| `SQL_SSLMODE` | SSL mode for Postgres connection |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint |
+| `AZURE_OPENAI_KEY` | Azure OpenAI API key |
+| `AZURE_OPENAI_DEPLOYMENT_CHAT` | Azure OpenAI chat deployment name |
+| `AZURE_OPENAI_API_VERSION` | Azure OpenAI API version |
+| `GHOST_ADMIN_DOMAIN` | Ghost admin domain (default: `https://queen-street-analytics-1.ghost.io`) |
+| `GHOST_ADMIN_API_KEY` | Ghost Admin API key (`key_id:secret_hex`) |
+
+## Usage
+
+### Render a single sector for one block
+
+```bash
+python newsletter.py --sector "Finance & Insurance" --start 2026-06-08 --end 2026-06-18
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--sector` | required | Sector name to render |
+| `--start` | none | Block start date, YYYY-MM-DD (inclusive) |
+| `--end` | none | Block end date, YYYY-MM-DD (inclusive) |
+| `--out` | `out/{sector_slug}_{block_slug}.html` | Output HTML file path |
+| `--no-llm` | off | Skip LLM narrative and per-bill context (fast/offline) |
+
+### Render every sector for one block
+
+```bash
+python block_run.py --start 2026-06-08 --end 2026-06-18
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--start` | none | Block start date, YYYY-MM-DD |
+| `--end` | none | Block end date, YYYY-MM-DD |
+| `--backfill-since` | none | Loop through every block since date via `CA_vote_scraper --list-blocks` |
+| `--sectors` | all 20 | Restrict to specific sectors |
+| `--dry-run` | off | List sectors without rendering |
+| `--no-llm` | off | Pass `--no-llm` to `newsletter.py` |
+| `--publish` | off | Push rendered HTML to Ghost as drafts (stage 1) |
+| `--auto-publish` | off | Push, publish live, and fire subscriber emails (stage 2) |
+| `--publish-silent` | off | Publish live without firing emails (backfills) |
+
+### Auto-detect the most recent closed block
+
+```bash
+python block_run.py --latest
+```
+
+Note: `--latest` is shorthand that resolves to the most recent block boundaries from the scraper tables.
+
+### Publish a single sector by hand
+
+```bash
+python ghost_publish.py \
+    --sector "Social Issues" \
+    --block-lbl "Jun 8-17, 2026" \
+    --block-slug "2026-06-08_2026-06-17" \
+    --html out/socialissues_2026-06-08_2026-06-17.html
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--sector` | required | Sector name |
+| `--block-lbl` | required | Human block label |
+| `--block-slug` | required | ISO block slug |
+| `--html` | required | Path to rendered HTML file |
+| `--auto-publish` | off | Flip draft to published and fire subscriber email |
+| `--publish-silent` | off | Publish to site without firing emails |
+
+### Promote existing drafts to published
+
+```bash
+# List what would be promoted
+python publish_existing_drafts.py --dry-run
+
+# Publish all CA-voting drafts silently (no emails)
+python publish_existing_drafts.py --silent
+
+# Publish all CA-voting drafts with emails
+python publish_existing_drafts.py
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--silent` | off | Publish without firing subscriber emails |
+| `--block-slug` | none | Restrict to a specific block |
+| `--dry-run` | off | List drafts without modifying Ghost |
+
+## Data sources and outputs
+
+### Sources
+
+- **`CA_vote_scraper` Postgres tables**: `hoc_voting_data` (division-level votes), `hoc_voting_ballot` (per-MP ballot records), `hoc_mp_roster` (MP metadata), and `hoc_vote_sector` (sector labels per division).
+- **Azure OpenAI**: Used for the sector-level narrative summary and per-bill editorial context. Deployment defaults to `gpt-4.1` with temperature `0.3`.
+
+### Outputs
+
+- **`out/{sector}_{block_slug}.html`**: Rendered newsletter HTML.
+- **`out/{sector}_{block_slug}_feature.svg`**: Party-split SVG of the most-contested bill, rasterized to PNG for Ghost's feature image.
+- **`out/{sector}_{block_slug}_excerpt.txt`**: First sentence of the LLM narrative (up to 200 characters), used as Ghost `custom_excerpt`.
+- **Ghost posts**: Draft or published posts tagged by sector and block edition, with visibility toggled between free and paid following the same rotation as `lobby-landscapes-canada`.
+- **`public.hoc_vote_block_run`**: Tracks which blocks have been fired, with timestamps and sector counts.
+
+## Tests
+
+There are no dedicated test files or test suites in the repository. Validation is performed through:
+
+- `--dry-run` on `block_run.py` to preview the run plan without rendering.
+- `--no-llm` on `newsletter.py` and `block_run.py` for fast, deterministic offline runs.
+- The Ghost Admin API's idempotent `(sector-tag, edition-tag)` lookup, which prevents duplicate drafts on re-runs.

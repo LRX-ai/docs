@@ -1,0 +1,198 @@
+---
+title: "US_vote_newsletter"
+sidebarTitle: "US Vote Newsletter"
+description: "Per-sector newsletter of US House and Senate roll-call votes, published weekly via Ghost."
+---
+
+The US Vote Newsletter renders a per-sector HTML newsletter of US Congressional roll-call votes for a given voting week, then publishes it as a Ghost draft or live post. It is adapted from the same architecture used by the EU and CA voting products, with a 4-layer pipeline that reads from Congress.gov API tables, classifies bills into 19 QSA sectors, composes rich HTML, and pushes to Ghost.
+
+The repository is maintained by [LRX-ai on GitHub](https://github.com/lrx-ai/US_vote_newsletter).
+
+## Overview
+
+The pipeline produces one newsletter per sector per voting week. A "voting week" is an ISO week (Monday to Sunday) in which either the House or the Senate held at least one roll-call vote. The composer queries PostgreSQL tables populated by the upstream scraper, groups votes by bill, extracts party splits and defectors, generates LLM-authored narrative context, renders styled HTML, and publishes the result to Ghost. Sectors with zero roll-calls in a given week skip themselves silently.
+
+## How it works
+
+The system follows a layered pipeline:
+
+1. **Classify bills** into 19 QSA sectors using an Azure OpenAI LLM (scripts/classify_bills.py). Each bill can map to 1-4 sectors; results are stored in usa.congress_bill_newsletter.
+2. **Load vote facts** from usa.congress_api_house_votes, usa.congress_api_senate_votes, and related member tables (data/fact_vote.py). This produces one row per roll-call per sector per bill.
+3. **Compose HTML** (newsletter.py) per sector per week: a sector-level LLM narrative, per-bill cards with vote tallies, party-split SVG charts, lists of representatives who broke with their party, and an optional embedded voting fragment.
+4. **Publish to Ghost** (ghost_publish.py) as drafts or live posts, routed through the correct sector-specific mailing list with free/paid tier rotation matching the US lobby product.
+
+A batch runner (block_run.py) loops over all 19 sectors for a given week. A state table (usa.house_vote_block_run) guards against double-firing.
+
+## Repository structure
+
+```text
+us_vote_newsletter/
+├── newsletter.py                    # Per-sector standalone HTML composer
+├── block_run.py                     # Batch runner over all 19 sectors
+├── block_utils.py                   # Voting-block date math: ISO weeks, labels, slugs
+├── block_state.py                   # Read/write usa.house_vote_block_run
+├── check_closed_block.py            # Jenkins guard: should Job B fire today?
+├── ghost_publish.py                 # Ghost Admin API client: drafts, publish, tags
+├── backfill_blocks.py               # Backfill all historical weeks as Ghost drafts
+├── publish_existing_drafts.py       # Promote reviewed drafts to published
+├── promote_backfilled_drafts.py     # Batch-promote a date range of drafts
+├── db_conn.py                       # Shared psycopg connection (env loading)
+├── requirements.txt                 # Python dependencies
+├── README.md                        # Run instructions and repo overview
+├── .env.example                     # Template for required env vars
+├── data/
+│   └── fact_vote.py                 # In-memory fact loader: bills, splits, defectors
+├── scripts/
+│   ├── classify_bills.py            # LLM classifier: bill -> 1-4 sectors
+│   ├── push_html_as_draft.py        # One-off manual HTML draft push
+│   ├── preview_fragment_in_host.py  # Preview voting fragment inside a mocked host
+│   ├── backfill_voting_into_published.py  # Retroactively append voting to published posts
+│   ├── cleanup_test_block.py        # Delete test drafts + reset block state
+│   ├── cleanup_voting_drafts.py     # Bulk-delete standalone voting drafts
+│   └── inspect_post.py              # Fetch a Ghost post's HTML for debugging
+└── sql/
+    ├── init.sql                     # CREATE TABLE for congress_bill_newsletter and house_vote_block_run
+    └── senate.sql                   # Senate-specific schema additions
+```
+
+## Setup
+
+1. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+2. Populate environment variables from `.env.example` into a `.env` file (gitignored). On Jenkins, these are injected by the pipeline.
+
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `SQL_HOST` | Azure PostgreSQL host |
+| `SQL_PORT` | PostgreSQL port (default 5432) |
+| `SQL_DBNAME` | Database name |
+| `SQL_USER` | PostgreSQL username |
+| `SQL_PASSWORD` | PostgreSQL password |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint |
+| `AZURE_OPENAI_KEY` | Azure OpenAI API key |
+| `AZURE_OPENAI_DEPLOYMENT_CHAT` | Chat model deployment name |
+| `GHOST_ADMIN_DOMAIN` | Ghost tenant domain |
+| `GHOST_ADMIN_API_KEY` | Ghost Admin API key (format: key_id:hex_secret) |
+
+## Usage
+
+### Single-sector newsletter
+
+Render one sector for a given week and write HTML to disk:
+
+```bash
+python newsletter.py --sector "Healthcare" --start 2025-06-02 --end 2025-06-06
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--sector` | required | Sector name, e.g. "Healthcare" |
+| `--start` | (from `--week`) | Block start date, YYYY-MM-DD (inclusive) |
+| `--end` | (from `--week`) | Block end date, YYYY-MM-DD (inclusive) |
+| `--week` | none | Any date in the target ISO week; snaps to Mon-Sun |
+| `--out` | auto | Output HTML path; defaults to `out/<sector_slug>_<block_slug>.html` |
+| `--no-llm` | off | Skip narrative and per-bill LLM context (fast/offline) |
+
+### Batch run for a week
+
+Render all sectors, optionally push drafts or auto-publish:
+
+```bash
+python block_run.py --start 2025-06-02 --end 2025-06-06
+python block_run.py --latest --publish
+python block_run.py --latest --auto-publish
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--start` | none | Block start date (used if `--latest` is not set) |
+| `--end` | none | Block end date (used if `--latest` is not set) |
+| `--latest` | off | Auto-detect the most recent closed voting week from the DB |
+| `--sectors` | all | Restrict to specific sectors |
+| `--publish` | off | Push rendered HTML to Ghost as DRAFTS |
+| `--auto-publish` | off | Push and immediately publish live |
+| `--dry-run` | off | List the plan without invoking the renderer |
+| `--no-llm` | off | Pass `--no-llm` through to each `newsletter.py` run |
+
+### Bill classification
+
+Map bills into QSA sectors via Azure OpenAI:
+
+```bash
+python scripts/classify_bills.py --limit 20
+python scripts/classify_bills.py --voted-only
+python scripts/classify_bills.py --reclassify
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--limit` | none | Smoke test: classify only N bills |
+| `--workers` | 5 | ThreadPoolExecutor concurrency |
+| `--voted-only` | off | Only classify bills that appear in at least one House roll-call |
+| `--reclassify` | off | Re-run even for bills already in the mapping table |
+
+### Publishing workflows
+
+Promote existing Ghost drafts to published after editorial review:
+
+```bash
+python publish_existing_drafts.py --start 2025-12-15 --end 2025-12-21 --dry-run
+python publish_existing_drafts.py --start 2025-12-15 --end 2025-12-21
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--start` | required | Block start date |
+| `--end` | required | Block end date |
+| `--dry-run` | off | List targets without PUT |
+| `--backdate` | off | Set published_at to block_end + GRACE_DAYS at 06:00 UTC |
+| `--no-email` | off | Publish without triggering the mailing list email |
+
+Backfill historical weeks as drafts:
+
+```bash
+python backfill_blocks.py --dry-run
+python backfill_blocks.py --after 2026-01-01 --no-llm
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--dry-run` | off | List what would run |
+| `--force` | off | Ignore fired-state and re-do everything |
+| `--skip-latest` | off | Exclude the most recent block |
+| `--after` | none | Only include weeks on/after this date |
+| `--before` | none | Only include weeks on/before this date |
+| `--no-llm` | off | Pass `--no-llm` through to `block_run.py` |
+
+## Data sources and outputs
+
+### Sources
+
+- **usa.congress_api_house_votes** and **usa.congress_api_senate_votes**: Roll-call vote headers from Congress.gov, populated by the upstream scraper.
+- **usa.congress_api_house_vote_members** / **usa.congress_api_senate_vote_members**: Per-member vote records including party affiliation and state.
+- **usa.congress_api_bill** and **usa.congress_api_bill_cosponsors**: Bill metadata, titles, policy areas, and primary sponsors.
+- **usa.congress_bill_newsletter**: LLM-generated sector mapping, populated by `classify_bills.py`.
+- **Azure OpenAI GPT-4.1**: Sector narrative and per-bill context paragraphs.
+
+### Outputs
+
+- **Ghost drafts/posts**: One per sector per voting week, tagged with the sector nav tag (e.g. "Healthcare (Washington)"), hub tag `#US`, edition tag `#us_voting_<slug>`, and `#no-hero`.
+- **Local HTML files**: Written to `out/` when rendered standalone.
+- **Feature SVG sidecars**: Per-post party-split hero images (`*_feature.svg`), rasterized to PNG and uploaded to Ghost.
+- **Excerpt sidecars**: Shorttext (`*_excerpt.txt`) used for Ghost's custom_excerpt field.
+
+## Tests
+
+There are no dedicated test files or test suites in the repository. Validation is performed through:
+
+- `--dry-run` flags on `block_run.py` to preview the execution plan.
+- `--no-llm` flag for fast, deterministic rendering without external API calls.
+- `--limit` flag on `classify_bills.py` for small smoke tests.
+- `scripts/preview_fragment_in_host.py` for visual preview of voting fragments inside a mocked newsletter host.
+- Idempotent writes in `usa.house_vote_block_run` and idempotent Ghost draft overwrites prevent duplicate publishing on re-runs.

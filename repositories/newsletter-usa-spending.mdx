@@ -1,0 +1,161 @@
+---
+title: "newsletter-usa-spending"
+sidebarTitle: "USA Spending Newsletter"
+description: "Generate quantitative federal-budget newsletters from USA Spending data, enriched with LLM-curated news summaries and published via Ghost CMS."
+---
+
+The USA Spending Newsletter system pulls federal agency financial data from USASpending.gov, computes month-over-month spending and budget metrics, visualizes the results, augments each report with AI-curated news, and publishes finished newsletters to a Ghost blog. The pipeline is organized as a sequence of modular Python steps orchestrated by a single CLI entry point.
+
+The repository is maintained by [LRX-ai on GitHub](https://github.com/lrx-ai/newsletter-usa-spending).
+
+## Overview
+
+The system reads agency-level obligated amounts and budget authority from a PostgreSQL mirror of the USASpending API. For each industry category (for example, Agri-Food, Finance, or Defence), it calculates percentage changes, 6-month rolling averages, peer benchmarks, and dollar deltas. Matplotlib generates three charts per newsletter: a side-by-side current-vs-previous month comparison, a horizontal comparison of this month against peers and the rolling average, and a 12-month trend line. An LLM reranks the most newsworthy agencies; SerpAPI searches reputable sources for recent coverage; and Azure OpenAI summarizes the top articles. A final HTML report is assembled and optionally uploaded to Ghost CMS as a draft post.
+
+## How it works
+
+1. **Load data** from `usa.usa_spending_agencies_monthly_reports` and the crosswalk table that maps agencies to newsletter categories.
+2. **Compute analytics** including current-month percentage and dollar changes, 6-month rolling averages, peer averages for all other agencies, and 12-month trend series with a 4-month trailing SMA.
+3. **Generate charts** for obligated amounts and budget authority (bar charts and line charts saved as high-resolution PNGs).
+4. **Select newsworthy agencies** by deterministic shortlisting (top 10 by absolute change) followed by an LLM rerank that picks 3-5 anchors and proposes 2-3 search queries per anchor.
+5. **Search and summarize news** using SerpAPI against reputable domains, then summarize each selected article via an Azure OpenAI structured-output call.
+6. **Build the HTML newsletter** embedding charts and curated news items.
+7. **Upload to Ghost** (optional) by replacing local image references with hosted Ghost URLs and creating a draft post via the Ghost Admin API.
+
+## Repository structure
+
+```text
+newsletter-usa-spending/
+├── step1_data_loader.py              # PostgreSQL connection and crosswalk lookups
+├── step2_analytics_engine.py         # Financial metric calculations (MoM, rolling, peer)
+├── step3_visualization.py            # Matplotlib chart generation
+├── step4_news_aggregator.py          # LLM reranker, SerpAPI search, content extraction, summarization
+├── step5_report_generator.py         # HTML newsletter assembly
+├── step6_orchestrator.py             # Main CLI entry point and pipeline orchestration
+├── step7_upload_to_ghost.py          # Ghost Admin API image upload and draft post creation
+├── requirements.txt                  # Python dependencies
+├── README.md                         # Usage and setup documentation
+├── reputable_domains.json            # Domain weights for news quality scoring
+├── newsletter_mapping/
+│   ├── newsletter_agency_mapping.csv # Maps agencies to newsletter categories
+│   └── newsletter_agency_mapping.py  # Helper scripts for mapping maintenance
+├── db_import_code/
+│   ├── usa_spending_agency_quarterly_import.py  # Quarterly agency snapshot loader
+│   ├── usa_spending_agency_monthly_import.py    # Monthly overview and budget API importer
+│   └── usa_spending_crosswalk.py                # Crosswalk maintenance utilities
+├── tests/
+│   ├── conftest.py                   # Adds project root to sys.path
+│   ├── test_aggregator.py            # Tests for news aggregation pipeline
+│   ├── test_reranker.py              # Tests for LLM reranker and fallback logic
+│   └── test_summarizer.py            # Tests for Azure OpenAI summarization
+├── analysis/
+│   ├── section_c_history.py          # Historical Section C trend analysis
+│   └── final_export/                 # Exported chart images and mapping files
+├── final_export/                     # Generated newsletters, images, and news cache
+└── archive/                          # Historical prototypes, sample CSVs, and thesis documents
+```
+
+## Setup
+
+1. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+2. Create a `.env` file in the repository root with the variables listed below.
+
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `ENDPOINT_URL` | Azure OpenAI endpoint URL |
+| `DEPLOYMENT_NAME` | Azure OpenAI model deployment name |
+| `AZURE_OPENAI_API_KEY` | API key for Azure OpenAI |
+| `SERPAPI_API_KEY` | API key for SerpAPI web search |
+| `GHOST_ADMIN_API_KEY` | Ghost Admin API key for publishing |
+| `GHOST_API_URL` | Base URL of the Ghost blog instance |
+| `NEWS_SEARCH_TIME_WINDOW` | Search recency filter (default `m2` for last 2 months) |
+| `NEWS_RESULTS_PER_QUERY` | Results per SerpAPI query (default `5`) |
+| `NEWS_MAX_PAGES` | Max total pages to fetch across all queries (default `12`) |
+| `NEWS_SHORTLIST_K` | Deterministic shortlist size before LLM rerank (default `10`) |
+| `NEWS_RERANK_TOP` | Number of anchor agencies to select (default `5`) |
+
+## Usage
+
+### Generate a single newsletter
+
+```bash
+python step6_orchestrator.py --newsletter "Agri-Food"
+```
+
+### Generate all newsletters
+
+```bash
+python step6_orchestrator.py --all
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--newsletter` | none | Generate a specific newsletter by category name |
+| `--all` | off | Generate newsletters for all mapped categories |
+| `--log-level` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+
+Running the orchestrator writes outputs to `final_export/`:
+
+- HTML report: `final_export/<Category>_YYYYMMDD_HHMMSS.html`
+- Charts: `final_export/img/<Category>_YYYYMMDD_HHMMSS_plot_1.png` (side-by-side), `plot_2.png` (comparison), `plot_3.png` (trends)
+- News cache: `final_export/news_cache.json`
+
+### Upload to Ghost CMS
+
+```bash
+python step7_upload_to_ghost.py
+```
+
+This scans `final_export/*.html`, uploads referenced images to Ghost, replaces local image paths with hosted URLs, and creates a draft post for each newsletter.
+
+### Import monthly data from USASpending API
+
+```bash
+python db_import_code/usa_spending_agency_monthly_import.py
+```
+
+Fetches overview and budgetary data for every toptier agency and upserts it into `usa.usa_spending_agencies_monthly_reports`.
+
+### Import quarterly agency snapshots
+
+```bash
+python db_import_code/usa_spending_agency_quarterly_import.py
+```
+
+Fetches the toptier agency list and upserts it into `usa.usa_spending_agencies_quarterly_reports`.
+
+## Data sources and outputs
+
+### Sources
+
+- **USASpending API**: `api.usaspending.gov` provides agency overviews and budgetary resources by fiscal period.
+- **PostgreSQL mirror**: The pipeline reads from `usa.usa_spending_agencies_monthly_reports` and `usa.usa_spending_crosswalk`.
+- **News search**: SerpAPI queries restricted to reputable U.S. policy and financial publishers (see `reputable_domains.json`).
+
+### Outputs
+
+- **HTML newsletters**: Self-contained reports with embedded charts and curated news summaries stored in `final_export/`.
+- **Chart images**: High-resolution PNGs for side-by-month comparisons, peer comparisons, and 12-month trend lines stored in `final_export/img/`.
+- **Ghost draft posts**: Uploaded via the Ghost Admin API with local image references replaced by hosted URLs.
+- **Intermediate CSVs**: `agency_overview_results.csv` and `agency_budget_results.csv` produced during database imports.
+
+## Scheduling and CI
+
+There are no Jenkins pipelines or GitHub Actions workflows in this repository. Execution is currently manual or triggered by external schedulers.
+
+## Tests
+
+The repository includes a `tests/` directory with pytest-based unit tests:
+
+- **`test_aggregator.py`**: Validates that the news aggregator uses provided queries, respects domain quality filters, and returns structured news items.
+- **`test_reranker.py`**: Tests the LLM reranker's structured anchor selection and deterministic fallback behavior when the LLM returns no tool calls.
+- **`test_summarizer.py`**: Tests the Azure OpenAI summarization client and its structured output parsing.
+
+Tests use lightweight module stubs for external dependencies (SerpAPI, Azure OpenAI, trafilatura, and requests) so they run without real API keys.

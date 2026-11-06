@@ -1,0 +1,230 @@
+---
+title: "eu_lobby_newsletter"
+sidebarTitle: "EU Lobby Newsletter"
+description: "Monthly, per-sector analytics newsletter pipeline for EU Transparency Register lobbying activity, rendering 19 sector editions end-to-end and publishing to Ghost CMS."
+---
+
+The EU Lobby Newsletter pipeline produces 19 sector-specific analytics newsletters each month from the EU Transparency Register. Each edition contains deterministic charts and prose across six analytic sections, a network graph header, an LLM-grounded "Real-World Context" block with verified citations, and is published to Ghost CMS.
+
+The repository is maintained by [LRX-ai on GitHub](https://github.com/lrx-ai/eu_lobby_newsletter).
+
+## Overview
+
+The pipeline transforms EU lobbying meeting records into newsletter-ready HTML for 19 sectors. For each edition month it:
+
+1. Reads fact rows from a PostgreSQL view (`eu.fact_meeting_org`) for every assigned newsletter.
+2. Generates six analytic sections (A through F) with Matplotlib charts and rule-based prose.
+3. Builds a meta-sector network graph of organisation-official interactions rendered as a PNG header.
+4. Generates a "Real-World Context" block using a two-pass Azure OpenAI grounded-generation pipeline.
+5. Assembles HTML via Jinja2 and publishes posts as drafts to Ghost CMS.
+
+The pipeline intentionally separates draft creation from promotion. The default `publish.py` run uploads drafts; a second `--publish` pass promotes them live, optionally with or without emails.
+
+## How it works
+
+The system follows a multi-step rendering and publishing pipeline:
+
+1. **Refresh the fact view** by running `db/verify_fact_table.py`, which recreates the `eu.fact_meeting_org` PostgreSQL view from `fact_table.sql`.
+2. **Resolve edition config** from `editions.csv` (or synthesize one from calendar arithmetic for the previous month if no row exists).
+3. **Generate meta-sector network graphs** per sector via Plotly, then screenshot to PNG using a headless browser.
+4. **Render six analytic sections** (A-F) per newsletter, each emitting chart figures and rule-based prose.
+5. **Generate implications** (optional) via a two-pass LLM pipeline: grounded prose with citations, then JSON restricted to vetted URLs, followed by a rescue search for sourceless items.
+6. **Assemble HTML** via a Jinja2 template, embedding charts as inline PNG images and the implications block.
+7. **Upload to Ghost** as drafts with tags, feature images, and ad insertions. Promote to published later via a separate command.
+
+## Repository structure
+
+```text
+eu_lobby_newsletter/
+├── config.py                    # Edition config loader; NEWSLETTERS list of 19 sectors
+├── editions.csv                 # Edition table: window, publish date, backdate
+├── fact_table.sql               # eu.fact_meeting_org view definition
+├── run.py                       # Single-sector or all-sector renderer (no upload)
+├── publish.py                   # End-to-end driver: render + upload to Ghost
+├── ghost_client.py              # Ghost Admin API client (upload, publish, overwrite)
+├── html_to_png.py               # Headless browser screenshot of Plotly network HTMLs
+├── requirements.txt             # Python dependencies
+├── README.md                    # Script-level docs and command reference
+├── env_config.py                # Shared .env discovery
+│
+├── db/
+│   ├── loader.py                # DB engine + fact-table loader with date windows
+│   └── verify_fact_table.py     # Recreate fact view and print coverage stats
+│
+├── sections/                    # Six analytic section modules (A-F)
+│   ├── a_industry.py            # Lobbying activity by industry
+│   ├── b_trend.py               # Lobbying trend via PanelOLS residuals
+│   ├── c_organizations.py       # Organizations behaving unusually
+│   ├── d_institutions.py        # Org-institution pair analysis
+│   ├── e_subjects.py            # Org-subject pair analysis
+│   └── f_officials.py           # Most-lobbied officials (org-official pairs)
+│
+├── charts/                      # Matplotlib chart primitives
+│   ├── bar.py                   # Grouped and side-by-side bar charts
+│   └── line.py                  # Trend line charts
+│
+├── metrics/                     # Aggregators, baselines, ranking, residuals
+│   ├── aggregator.py            # Roll-up by industry, org, pair, etc.
+│   ├── baselines.py             # 12-month rolling and same-month averages
+│   ├── ranking.py               # Deviation ranking and increase/decrease split
+│   └── residuals.py             # PanelOLS residual computation for Section B
+│
+├── prose/                       # Rule-based prose templates + LLM implications
+│   ├── templates.py             # Sentence builders for each section
+│   ├── implications.py          # Two-pass LLM implication pipeline
+│   └── interpreter.py           # Chart-to-text helpers
+│
+├── network_graphs/
+│   └── meta_sector.py           # Sector-scoped org x official network graph generation
+│
+├── render/                      # Jinja assembly
+│   ├── newsletter.py            # Orchestrator that assembles final HTML
+│   ├── template.html.j2         # Jinja newsletter template
+│   └── branding.py              # PNG watermarking
+│
+├── display_names/               # Industry and institution display-name tables
+└── assets/                      # Inter font files for chart rendering
+```
+
+## Setup
+
+1. Install dependencies:
+
+```bash
+python -m venv venv
+source venv/bin/activate  # or venv\Scripts\activate on Windows
+pip install -r requirements.txt
+```
+
+2. Create a `.env` file in the repository root with the variables below.
+
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `SQL_HOST` | PostgreSQL host |
+| `SQL_PORT` | PostgreSQL port |
+| `SQL_DBNAME` | PostgreSQL database name |
+| `SQL_USER` | PostgreSQL username |
+| `SQL_PASSWORD` | PostgreSQL password |
+| `SQL_SSLMODE` | SSL mode for PostgreSQL connection (e.g. `require`) |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource endpoint |
+| `AZURE_OPENAI_KEY` | API key for Azure OpenAI |
+| `AZURE_OPENAI_DEPLOYMENT_CHAT` | Azure OpenAI deployment name (default `gpt-4.1`) |
+| `GHOST_ADMIN_API_KEY` | Ghost Admin API key (`id:secret` format) |
+
+## Usage
+
+### Full monthly workflow
+
+Render drafts for all 19 sectors targeting the previous calendar month, then upload to Ghost as drafts:
+
+```bash
+python publish.py
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--edition` | latest | Edition number from `editions.csv` |
+| `--newsletter` | all 19 | Render only this sector |
+| `--out` | `final_export` | Output directory |
+| `--no-upload` | off | Render HTML only, skip Ghost upload |
+| `--no-implications` | off | Skip the LLM Real-World Context block |
+| `--no-network` | off | Skip generating fresh network graph headers |
+| `--publish` | off | Promote drafts to published instead of running the pipeline |
+| `--no-email` | off | With `--publish`: post goes live without emailing subscribers |
+| `--all-editions` | off | With `--publish`: iterate every row in `editions.csv` |
+| `--overwrite` | off | Replace existing published posts for this edition in place |
+| `--skip-lede` | off | Skip LLM lede generation |
+| `--skip-section` | none | Skip a section by key (A-F); repeatable |
+
+### Promote drafts to published
+
+Publish drafts from the default monthly run without sending emails:
+
+```bash
+python publish.py --publish --no-email
+```
+
+### Render a single sector locally
+
+```bash
+python run.py --edition 12 --newsletter "Manufacturing"
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--edition` | latest | Edition number from `editions.csv` |
+| `--newsletter` | required (or `--all`) | One newsletter name |
+| `--all` | off | Render all 19 newsletters |
+| `--out` | `final_export` | Output directory |
+| `--skip-section` | none | Skip a section by key (A-F); repeatable |
+| `--refresh-view` | off | Recreate `eu.fact_meeting_org` before rendering |
+| `--with-implications` | off | Generate implications inline before rendering |
+
+### Generate implications only
+
+```bash
+python prose/implications.py --edition 12 --newsletter "Manufacturing"
+python prose/implications.py --edition 12 --all
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--edition` | latest | Edition number |
+| `--newsletter` | required (or `--all`) | One newsletter name |
+| `--all` | off | Run for all newsletters |
+| `--out` | `final_export/implications` | Output directory for JSON files |
+
+### Refresh fact view and verify coverage
+
+```bash
+python db/verify_fact_table.py
+```
+
+### Overwrite an old edition in place
+
+Preview without writes:
+
+```bash
+python scripts/overwrite_published_posts.py --month 2026-03
+```
+
+Confirm overwrite for one sector:
+
+```bash
+python scripts/overwrite_published_posts.py --month 2026-03 --only-sector "Manufacturing" --confirm
+```
+
+## Data sources and outputs
+
+### Sources
+
+- **EU Transparency Register**: The primary source of lobbying meeting records, stored in PostgreSQL tables under the `eu` schema.
+- **`eu.eu_lobby_actor`**: Actor registry with newsletter assignments and industry codes.
+- **`eu.eu_lobby_meeting`**: Meeting records with dates, subjects, and institution links.
+- **`eu.eu_lobby_meeting_lobbyist`**: Many-to-many linking meetings to lobbying organizations.
+- **`eu.eu_lobby_meeting_attendee`**: Individual attendees per meeting, used for Section F.
+- **Azure OpenAI**: GPT-4.1 deployment for the implications (Real-World Context) generation layer.
+
+### Outputs
+
+- **`final_export/{sector_slug}_ed{N}_{timestamp}.html`**: Assembled newsletter HTML per sector.
+- **`final_export/img/`**: Chart PNGs and network graph header images.
+- **`final_export/implications/`**: JSON files containing vetted LLM implications and citations.
+- **`final_export/network_html/`**: Interactive Plotly network graph HTML files.
+- **Ghost CMS posts**: Drafts or published posts uploaded via the Ghost Admin API.
+
+## Scheduling and CI
+
+There are no Jenkinsfiles or GitHub Actions workflows in the repository. The pipeline is designed to be invoked manually or scheduled via an external cron system.
+
+## Tests
+
+There are no dedicated test files or test suites in the repository. Validation is performed through:
+
+- `--no-upload` runs to preview rendered HTML before publishing.
+- `--no-implications` runs to skip the LLM layer and test deterministic sections.
+- `--skip-section` flags to isolate individual sections during iteration.
+- `--dry-run` modes in the display-name generation scripts.
+- `db/verify_fact_table.py` output to sanity-check the fact view coverage before rendering.
